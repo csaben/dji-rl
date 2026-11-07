@@ -142,7 +142,8 @@ def save_ply(g: Gaussians, path: Path) -> None:
 
 @torch.no_grad()
 def bake_esdf(g: Gaussians, voxel: float = 0.1, pad: float = 2.0, min_opacity: float = 0.3,
-              min_neighbors: int = 2, bounds: tuple | None = None, max_scale: float | None = None) -> ESDF:
+              min_neighbors: int = 2, bounds: tuple | None = None, max_scale: float | None = None,
+              min_component: int = 0) -> ESDF:
     """Occupancy from opaque Gaussians (centre + points on their 1.5-sigma ellipsoid), isolated-voxel
     (floater) removal, then a signed Euclidean distance transform."""
     from scipy.ndimage import distance_transform_edt
@@ -177,6 +178,15 @@ def bake_esdf(g: Gaussians, voxel: float = 0.1, pad: float = 2.0, min_opacity: f
         nb = o.to(torch.int16) - occ.to(torch.int16)
         occ &= nb >= min_neighbors
     o = occ.cpu().numpy()
+    if min_component > 0:  # drop free-floating specks (splat floaters): small 3D connected components
+        from scipy.ndimage import label
+        lab, n = label(o, structure=np.ones((3, 3, 3), bool))
+        sizes = np.bincount(lab.ravel())
+        small = sizes < min_component
+        small[0] = False
+        removed = int(small[1:].sum())
+        o = o & ~small[lab]
+        print(f"bake_esdf: removed {removed}/{n} occupied components smaller than {min_component} voxels", flush=True)
     sdf = (distance_transform_edt(~o) - distance_transform_edt(o)) * voxel
     return ESDF(torch.from_numpy(sdf.astype(np.float32)), lo.cpu().float(), voxel)
 

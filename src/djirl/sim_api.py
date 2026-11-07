@@ -29,6 +29,7 @@ from .scene import Scene, load_scene
 REPO = Path(__file__).resolve().parents[2]
 SPLATS = REPO / "data" / "splats"
 DRONE_R = 0.25
+COLUMN_START = 1.0  # m above ground where the takeoff/landing column check starts (ignores grass / low clutter)
 
 
 class SimAPI:
@@ -72,6 +73,14 @@ class SimAPI:
         hi = lo + float(z["voxel"]) * (np.array(z["sdf"].shape) - 1)
         return {"x0": round(float(lo[0]), 2), "y0": round(float(lo[1]), 2), "x1": round(float(hi[0]), 2),
                 "y1": round(float(hi[1]), 2), "zmax": round(float(hi[2]), 2)}
+
+    @staticmethod
+    def q(s, P):
+        """ESDF distance, treating anything above the collision grid's ceiling as free air
+        (the grid is capped at --max-height when imported; above it there is only sky)."""
+        d = s.esdf.query(P)
+        top = float(s.esdf.upper[2])
+        return torch.where(P[..., 2] > top - 0.05, torch.clamp(d, min=P[..., 2] - top + 5.0), d)
 
     # ------------------------------------------------------------ maps
     def _grid(self, name, px):
@@ -124,7 +133,40 @@ class SimAPI:
         s = self.scene(name)
         X, Y = self._pixel_xy(name, px)
         P = torch.stack([X, Y, torch.full_like(X, float(alt))], -1)
-        blocked = s.esdf.query(P.reshape(-1, 3)).reshape(X.shape) < float(clear)
+        blocked = self.q(s, P.reshape(-1, 3)).reshape(X.shape) < float(clear)
+        buf = io.BytesIO()
+        Image.fromarray(blocked.cpu().numpy().astype("uint8") * 255).save(buf, "PNG")
+        return buf.getvalue()
+
+    @torch.no_grad()
+    def column_blocked(self, s, X, Y, alt):
+        """Same test as fly(): ground gz = first ESDF<0.05 scanning down from alt; blocked if any
+        z in [gz+COLUMN_START, alt] (0.2 m steps) has ESDF < DRONE_R+0.1. X,Y: same-shape tensors."""
+        flat_x, flat_y = X.reshape(-1), Y.reshape(-1)
+        out = torch.zeros(len(flat_x), dtype=torch.bool, device=self.dev)
+        gz_all = torch.zeros(len(flat_x), device=self.dev)
+        zs_down = torch.arange(alt, -3.0, -0.1, device=self.dev)
+        zs_col = torch.arange(-2.4, alt + 1e-6, 0.2, device=self.dev)
+        for i in range(0, len(flat_x), 65536):
+            x, y = flat_x[i:i + 65536], flat_y[i:i + 65536]
+            n = len(x)
+            P = torch.stack([x[:, None].expand(n, len(zs_down)), y[:, None].expand(n, len(zs_down)),
+                             zs_down[None].expand(n, -1)], -1)
+            hit = self.q(s, P.reshape(-1, 3)).reshape(n, -1) < 0.05
+            gz = torch.where(hit.any(1), zs_down[hit.float().argmax(1)], torch.zeros(n, device=self.dev))
+            P = torch.stack([x[:, None].expand(n, len(zs_col)), y[:, None].expand(n, len(zs_col)),
+                             zs_col[None].expand(n, -1)], -1)
+            sd = self.q(s, P.reshape(-1, 3)).reshape(n, -1)
+            in_col = (zs_col[None] >= gz[:, None] + COLUMN_START) & (zs_col[None] <= alt)
+            out[i:i + n] = ((sd < DRONE_R + 0.1) & in_col).any(1)
+            gz_all[i:i + n] = gz
+        return out.reshape(X.shape), gz_all.reshape(X.shape)
+
+    @torch.no_grad()
+    def column_png(self, name, alt, px=1024) -> bytes:
+        s = self.scene(name)
+        X, Y = self._pixel_xy(name, px)
+        blocked, _ = self.column_blocked(s, X, Y, float(alt))
         buf = io.BytesIO()
         Image.fromarray(blocked.cpu().numpy().astype("uint8") * 255).save(buf, "PNG")
         return buf.getvalue()
@@ -133,7 +175,7 @@ class SimAPI:
     @torch.no_grad()
     def _ground_z(self, s, x, y, top):
         zs = torch.arange(top, -3.0, -0.1, device=self.dev)
-        sd = s.esdf.query(torch.stack([torch.full_like(zs, x), torch.full_like(zs, y), zs], -1))
+        sd = self.q(s, torch.stack([torch.full_like(zs, x), torch.full_like(zs, y), zs], -1))
         hit = (sd < 0.05).nonzero()
         return float(zs[hit[0, 0]]) if len(hit) else 0.0
 
@@ -145,7 +187,7 @@ class SimAPI:
         ys = np.arange(lo[1] + res / 2, hi[1], res)
         X, Y = np.meshgrid(xs, ys, indexing="ij")
         P = torch.tensor(np.stack([X, Y, np.full_like(X, alt)], -1).reshape(-1, 3), dtype=torch.float32, device=self.dev)
-        free = (e.query(P).reshape(X.shape) >= clear).cpu().numpy()
+        free = (self.q(s, P).reshape(X.shape) >= clear).cpu().numpy()
         nx, ny = free.shape
         cell = lambda p: (int(round((p[0] - xs[0]) / res)), int(round((p[1] - ys[0]) / res)))
         sa, sb = cell(a), cell(b)
@@ -188,7 +230,7 @@ class SimAPI:
         def visible(p, q):
             n = max(2, int(np.linalg.norm(q - p) / 0.2))
             seg = torch.tensor(np.linspace(p, q, n), dtype=torch.float32, device=self.dev)
-            return bool((e.query(seg) >= clear * 0.9).all())
+            return bool((self.q(s, seg) >= clear * 0.9).all())
         out, i = [pts[0]], 0
         while i < len(pts) - 1:
             j = len(pts) - 1
@@ -215,11 +257,12 @@ class SimAPI:
             return {"ok": False, "reason": why}
         gA = self._ground_z(s, a[0], a[1], alt)
         gB = self._ground_z(s, b[0], b[1], alt)
-        # columns at A and B must be clear for the climb/descent
-        for nm, (x, y), gz in (("A", a, gA), ("B", b, gB)):
-            zs = torch.arange(gz + 0.6, alt, 0.2, device=self.dev)
-            if tol and len(zs) and bool((s.esdf.query(torch.stack([torch.full_like(zs, x), torch.full_like(zs, y), zs], -1)) < DRONE_R + 0.1).any()):
-                return {"ok": False, "reason": f"vertical column above {nm} is blocked (overhang between ground and {alt} m)"}
+        # columns at A and B must be clear for the climb/descent (same test as the column occupancy mask)
+        if tol:
+            for nm, (x, y) in (("A", a), ("B", b)):
+                blk, _ = self.column_blocked(s, torch.tensor([[x]], device=self.dev), torch.tensor([[y]], device=self.dev), alt)
+                if bool(blk[0, 0]):
+                    return {"ok": False, "reason": f"vertical column above {nm} is blocked (overhang between ground and {alt} m)"}
         P = StickParams(dr=0.0, wind_std=0.3 if wind else 0.0)
         dyn = StickDynamics(1, P, self.dev, control_dt=0.1, substeps=5)
         start = torch.tensor([[a[0], a[1], (gA + 0.35) if tol else alt]], device=self.dev)
@@ -235,7 +278,7 @@ class SimAPI:
             vel = dyn.vel[0].cpu().numpy()
             yaw = float(dyn.yaw[0])
             cmd, done = ctl.command(pos, vel, yaw)
-            clear_now = float(s.esdf.query(dyn.pos)[0])
+            clear_now = float(self.q(s, dyn.pos)[0])
             traj.append({"t": round(t, 2), "x": round(float(pos[0]), 3), "y": round(float(pos[1]), 3), "z": round(float(pos[2]), 3),
                          "vx": round(float(vel[0]), 3), "vy": round(float(vel[1]), 3), "vz": round(float(vel[2]), 3),
                          "yaw": round(yaw, 4), "cmd": [round(float(c), 3) for c in cmd], "clear": round(clear_now, 3)})
@@ -243,7 +286,7 @@ class SimAPI:
                 reached = True
                 break
             subs = dyn.step(torch.tensor([cmd], dtype=torch.float32, device=self.dev))
-            sd = s.esdf.query(torch.cat(subs))
+            sd = self.q(s, torch.cat(subs))
             if ctl.phase == "cruise":  # clearance stat = en-route only (takeoff/landing touch the ground)
                 min_clear = min(min_clear, float(sd.min()))
             hit = bool(sd.min() < DRONE_R)

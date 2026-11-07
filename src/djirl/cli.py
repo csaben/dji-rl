@@ -62,7 +62,7 @@ def cmd_import_ply(a):
     hi = torch.quantile(m[::max(1, len(m) // 500_000)], 0.99, dim=0) + 5
     lo[2], hi[2] = max(lo[2].item(), -3.0), min(hi[2].item(), a.max_height)
     esdf = bake_esdf(g, voxel=a.voxel, bounds=(lo.tolist(), hi.tolist()), min_opacity=a.min_opacity,
-                     min_neighbors=a.min_neighbors, max_scale=a.max_scale)
+                     min_neighbors=a.min_neighbors, max_scale=a.max_scale, min_component=a.min_component)
     print(f"esdf bounds {[round(x, 1) for x in lo.tolist()]} .. {[round(x, 1) for x in hi.tolist()]}")
     wps = torch.tensor(json.loads(Path(a.waypoints).read_text())) if a.waypoints else torch.zeros(1, 3)
     # save the (already transformed) gaussians with an identity transform
@@ -173,6 +173,7 @@ def main():
     p.add_argument("--min-opacity", type=float, default=0.3, help="gaussians below this don't count as obstacles")
     p.add_argument("--min-neighbors", type=int, default=2, help="drop isolated occupied voxels (floaters)")
     p.add_argument("--max-scale", type=float, default=None, help="gaussians larger than this (m) don't count as obstacles")
+    p.add_argument("--min-component", type=int, default=0, help="drop occupied 3D blobs smaller than this many voxels (floaters)")
     p.set_defaults(f=cmd_import_ply)
     for name, f in (("bench", cmd_bench), ("train", cmd_train), ("rollout", cmd_rollout), ("preview", cmd_preview), ("serve", cmd_serve)):
         p = sub.add_parser(name, parents=[common])

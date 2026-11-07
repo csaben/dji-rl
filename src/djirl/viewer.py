@@ -305,6 +305,9 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                                       {"X-Bounds": json.dumps(meta), "Access-Control-Expose-Headers": "X-Bounds"})
                 if what == "topdown.json":
                     return self._json(200, api.topdown_meta(name, px))
+                if what == "occupancy" and q.get("mode") == "column":
+                    return self._send(200, api.column_png(name, float(q.get("alt", 5)), px), "image/png",
+                                      {"X-Bounds": json.dumps(api.topdown_meta(name, px))})
                 if what == "occupancy":
                     return self._send(200, api.occupancy_png(name, float(q.get("alt", 5)), float(q.get("clear", 1.5)), px),
                                       "image/png", {"X-Bounds": json.dumps(api.topdown_meta(name, px))})
