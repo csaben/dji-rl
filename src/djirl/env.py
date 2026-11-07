@@ -43,7 +43,18 @@ class EnvConfig:
     w_smooth: float = 0.02
     w_alive: float = 0.0
     render_chunk: int = 128
-    hazard_labels: bool = False   # add ESDF hazard labels (clearance along velocity, must_brake) to info
+    radius_clip: float = 0.0       # see Renderer; 2.0 for big scenes
+    full_quality_frac: float = 1.0
+    hazard_labels: bool = False
+    # task: "loop" = fly the scene's waypoint loop; "a2b" = random start -> random goal in free space
+    task: str = "loop"
+    a2b_min_dist: float = 15.0
+    a2b_max_dist: float = 60.0
+    a2b_alt: tuple = (1.5, 8.0)       # m above ground for starts/goals
+    a2b_clearance: float = 2.0        # starts/goals at least this far from any surface
+    a2b_coverage: float = 20.0        # only within this horizontal distance of the capture path (where the splat is good)
+    a2b_heading_noise: float = 1.2    # rad, initial yaw = bearing to goal + N(0, this)
+    w_success: float = 20.0   # add ESDF hazard labels (clearance along velocity, must_brake) to info
     stick: StickParams = field(default_factory=StickParams)
 
 
@@ -56,12 +67,17 @@ class BatchEnv:
         self.dt = 1.0 / cfg.control_hz
         self.max_steps = int(cfg.episode_s * cfg.control_hz)
         self.dyn = StickDynamics(n, cfg.stick, self.dev, self.dt, cfg.substeps)
-        self.renderer = Renderer(self.s.gaussians, cfg.width, cfg.height, cfg.hfov_deg, cfg.render_chunk)
+        self.renderer = Renderer(self.s.gaussians, cfg.width, cfg.height, cfg.hfov_deg, cfg.render_chunk,
+                                 radius_clip=cfg.radius_clip, full_frac=cfg.full_quality_frac)
         self.encoder = encoder or LatentEncoder(self.dev)
         self.wps = self.s.waypoints
         self.W = len(self.wps)
         self.pitch = torch.full((n,), cfg.gimbal_pitch_deg * torch.pi / 180, device=self.dev)
         self.target = torch.zeros(n, dtype=torch.long, device=self.dev)
+        self.goal = torch.zeros(n, 3, device=self.dev)
+        self.ep_success = torch.zeros(n, device=self.dev)
+        if cfg.task == "a2b":
+            self.cands = self._a2b_candidates()
         self.t = torch.zeros(n, dtype=torch.long, device=self.dev)
         self.prev_dist = torch.zeros(n, device=self.dev)
         self.last_action = torch.zeros(n, 4, device=self.dev)
@@ -80,7 +96,29 @@ class BatchEnv:
         return self.s.esdf.query(p)
 
     def _goal(self):
-        return self.wps[self.target]
+        return self.goal if self.cfg.task == "a2b" else self.wps[self.target]
+
+    def _a2b_candidates(self):
+        """Free-space points (1 m grid) at flight altitudes, near the capture path (scene waypoints are
+        spread along it), with clearance. Starts and goals are sampled from these."""
+        cfg, e = self.cfg, self.s.esdf
+        lo, hi = e.origin, e.upper
+        xs = torch.arange(float(lo[0]) + 1, float(hi[0]) - 1, 1.0, device=self.dev)
+        ys = torch.arange(float(lo[1]) + 1, float(hi[1]) - 1, 1.0, device=self.dev)
+        zs = torch.arange(cfg.a2b_alt[0], cfg.a2b_alt[1] + 1e-6, 1.0, device=self.dev)
+        X, Y, Z = torch.meshgrid(xs, ys, zs, indexing="ij")
+        P = torch.stack([X, Y, Z], -1).reshape(-1, 3)
+        # distance (xy) to the polyline through the waypoints (closed loop)
+        a, b = self.wps[:, :2], torch.roll(self.wps, -1, 0)[:, :2]
+        ab = b - a
+        t = (((P[:, None, :2] - a[None]) * ab[None]).sum(-1) / (ab * ab).sum(-1).clamp_min(1e-6)).clamp(0, 1)
+        d = (P[:, None, :2] - (a[None] + t[..., None] * ab[None])).norm(dim=-1).min(1).values
+        P = P[d < cfg.a2b_coverage]
+        P = P[self._sdf(P) > cfg.a2b_clearance]
+        if len(P) < 100:
+            raise RuntimeError(f"only {len(P)} free a2b points; check scene/waypoints/alt range")
+        print(f"a2b: {len(P)} candidate start/goal points", flush=True)
+        return P
 
     def _to_body(self, v_world):
         c, s = torch.cos(self.dyn.yaw), torch.sin(self.dyn.yaw)
@@ -114,8 +152,37 @@ class BatchEnv:
         v0 = torch.stack([torch.cos(yaw), torch.sin(yaw), torch.zeros_like(yaw)], -1) * torch.rand(m, 1, device=self.dev) * 3
         return p, yaw, v0, tgt
 
+    def _spawn_a2b(self, idx):
+        cfg, C, m = self.cfg, self.cands, len(idx)
+        k = 16
+        si = torch.randint(0, len(C), (m,), device=self.dev)
+        p = C[si]
+        gi = torch.randint(0, len(C), (m, k), device=self.dev)
+        g = C[gi]
+        dd = (g - p[:, None]).norm(dim=-1)
+        ok = (dd > cfg.a2b_min_dist) & (dd < cfg.a2b_max_dist)
+        pick = torch.where(ok.any(1), ok.float().argmax(1), dd.argmax(1))
+        goal = g[torch.arange(m, device=self.dev), pick]
+        d = goal - p
+        yaw = torch.atan2(d[:, 1], d[:, 0]) + torch.randn(m, device=self.dev) * cfg.a2b_heading_noise
+        return p, yaw, torch.zeros(m, 3, device=self.dev), goal
+
     def _reset_idx(self, idx):
         if len(idx) == 0:
+            return
+        if self.cfg.task == "a2b":
+            p, yaw, v0, goal = self._spawn_a2b(idx)
+            self.goal[idx] = goal
+            tgt = torch.zeros(len(idx), dtype=torch.long, device=self.dev)
+            self.ep_success[idx] = 0
+            self.dyn.reset(idx, p, yaw, v0)
+            self.target[idx] = tgt
+            self.t[idx] = 0
+            self.prev_dist[idx] = (goal - p).norm(dim=-1)
+            self.last_action[idx] = 0
+            self.has_height[idx] = torch.rand(len(idx), device=self.dev) < self.cfg.height_available
+            self.ep_return[idx] = 0
+            self.ep_wps[idx] = 0
             return
         p, yaw, v0, tgt = self._spawn(idx)
         self.dyn.reset(idx, p, yaw, v0)
@@ -176,8 +243,11 @@ class BatchEnv:
         dist = (self._goal() - pos).norm(dim=-1)
         progress = self.prev_dist - dist
         reached = dist < cfg.wp_radius
-        self.target = torch.where(reached, (self.target + 1) % self.W, self.target)
-        self.prev_dist = torch.where(reached, (self._goal() - pos).norm(dim=-1), dist)
+        if cfg.task == "a2b":
+            self.prev_dist = dist
+        else:
+            self.target = torch.where(reached, (self.target + 1) % self.W, self.target)
+            self.prev_dist = torch.where(reached, (self._goal() - pos).norm(dim=-1), dist)
 
         smooth = ((action - self.last_action) ** 2).sum(-1)
         reward = (cfg.w_progress * progress + cfg.w_waypoint * reached.float()
@@ -187,6 +257,11 @@ class BatchEnv:
         self.last_action = action
         self.t += 1
         terminated = collided | oob
+        if cfg.task == "a2b":
+            success = reached & ~collided & ~oob
+            reward = reward + cfg.w_success * success.float()
+            terminated = terminated | success
+            self.ep_success = torch.maximum(self.ep_success, success.float())
         truncated = (self.t >= self.max_steps) & ~terminated
         done = terminated | truncated
         self.ep_return += reward
@@ -199,6 +274,7 @@ class BatchEnv:
             info["final_length"] = self.t[done].float().clone()
             info["final_waypoints"] = self.ep_wps[done].clone()
             info["final_collided"] = collided[done].float()
+            info["final_success"] = self.ep_success[done].clone()
         if cfg.hazard_labels:  # labels for the post-step state, before autoreset replaces it
             from .hazard import BrakeModel, hazard_labels
             info["hazard"] = hazard_labels(self, getattr(self, "brake", None) or BrakeModel())

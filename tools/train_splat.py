@@ -155,7 +155,7 @@ def level_ground(T, means, opac, cam_enu, iters=400, tol=0.15):
         return T
     inl = q[np.abs(q @ bn + bd) < tol]
     c = inl.mean(0)
-    _, _, vt = np.linalg.svd(inl - c)
+    _, _, vt = np.linalg.svd(inl - c, full_matrices=False)
     n = vt[2] if vt[2][2] > 0 else -vt[2]
     z = np.array([0.0, 0, 1])
     v, cth = np.cross(n, z), n @ z
@@ -182,6 +182,7 @@ def main():
     ap.add_argument("--crop-margin", type=float, default=30.0, help="drop gaussians this far (m) beyond the camera bbox")
     ap.add_argument("--max-side", type=int, default=0, help="resize so the longest image side is at most this")
     ap.add_argument("--holdout", type=int, default=20, help="every Nth view is held out for PSNR (0 = none)")
+    ap.add_argument("--view-pad", type=float, default=0.25, help="keep views within the drone camera bbox padded by this fraction")
     a = ap.parse_args()
     dev = torch.device(a.device)
     torch.manual_seed(0)
@@ -194,6 +195,24 @@ def main():
         pycolmap.undistort_images(und, model, a.recon / "images")
     views, pts, cols = load_views(und, a.downscale, dev, a.max_side)
     print(f"{len(views)} views at {views[0]['W']}x{views[0]['H']}, {len(pts)} sfm points", flush=True)
+    # drop mis-registered views: SfM sometimes places a few frames far from where they could be
+    # (e.g. phone frames 1 km away). Keep views inside the drone's camera volume (+pad), else a
+    # robust median/MAD box over all views.
+    C = np.array([v["center"] for v in views])
+    ref = np.array([v["center"] for v in views if v["name"].startswith("drone/")])
+    if len(ref) >= 10:
+        lo, hi = ref.min(0), ref.max(0)
+        pad = (hi - lo) * a.view_pad
+        lo, hi = lo - pad, hi + pad
+    else:
+        med = np.median(C, 0)
+        mad = np.median(np.abs(C - med), 0) * 1.4826 + 1e-6
+        lo, hi = med - 4 * mad, med + 4 * mad
+    inb = ((C > lo) & (C < hi)).all(1)
+    if (~inb).any():
+        dropped = sorted({v["name"].split("/")[0] for v, k in zip(views, inb) if not k})
+        print(f"dropping {int((~inb).sum())}/{len(views)} out-of-volume views (sources: {dropped})", flush=True)
+        views = [v for v, k in zip(views, inb) if k]
 
     centers = np.array([v["center"] for v in views])
     scene_scale = float(np.linalg.norm(centers - centers.mean(0), axis=1).max()) * 1.1

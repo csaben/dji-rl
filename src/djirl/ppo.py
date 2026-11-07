@@ -118,8 +118,9 @@ def train(env: BatchEnv, run_dir: Path, cfg: PPOConfig, meta: dict | None = None
             log_stat("speed", info["speed"].mean())
             log_stat("collide_rate", info["collided"].float().mean())
             if "final_return" in info:
-                for k in ("final_return", "final_length", "final_waypoints", "final_collided"):
-                    stats.setdefault(k, []).extend(info[k].tolist())
+                for k in ("final_return", "final_length", "final_waypoints", "final_collided", "final_success"):
+                    if k in info:
+                        stats.setdefault(k, []).extend(info[k].tolist())
         with torch.no_grad():
             last_v = model.value(_slice(obs, slice(None)))
         adv = torch.zeros_like(rews)

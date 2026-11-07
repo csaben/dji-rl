@@ -61,7 +61,7 @@
     <select id="ckpt"></select>
     <label>Stick scale <span id="scaleV">60%</span></label>
     <input type="range" id="scale" min="10" max="100" value="60">
-    <label style="display:flex;gap:6px;align-items:center;margin-top:8px;color:var(--text)"><input type="checkbox" id="noclip" style="width:auto"> Explore: fly through walls (N)</label>
+    <label style="display:flex;gap:6px;align-items:center;margin-top:8px;color:var(--text)"><input type="checkbox" id="noclip" style="width:auto"> Explore: fly through walls (N). Hits still count.</label>
     <div class="row" style="margin-top:8px"><button id="reset">Reset to home (R)</button></div>
 
     <h2>Scene</h2>
@@ -152,7 +152,7 @@ function fmt(v, d = 1) { return v === null || v === undefined ? "–" : (+v).toF
 function drawHud(s, fps) {
   const cl = s.clearance < 0.5 ? "bad" : s.clearance < 1.5 ? "warn" : "ok";
   $("hud").innerHTML = [
-    ["mode", s.mode], ["speed", fmt(s.speed) + " m/s"], ["fwd/right/up", s.vel_body.map((v) => fmt(v)).join(" / ")],
+    ["mode", s.mode + (noclip ? " · explore (pass-through)" : "")], ["speed", fmt(s.speed) + " m/s"], ["fwd/right/up", s.vel_body.map((v) => fmt(v)).join(" / ")],
     ["height (down)", s.agl === null ? "out of range" : fmt(s.agl) + " m"], ["clearance", `<span class="${cl}">${fmt(s.clearance, 2)} m</span>`],
     ["pos ENU", s.pos.map((v) => fmt(v)).join(", ")], ["heading", fmt(s.yaw_deg, 0) + "°"],
     ["waypoint", `#${s.waypoint} · ${fmt(s.wp_dist)} m`], ["collisions", s.collisions], ["fps", fmt(fps, 0)],

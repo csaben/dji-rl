@@ -48,6 +48,7 @@ class Session:
         self.dyn = StickDynamics(1, self.params, self.dev, control_dt=1 / 30, substeps=2)
         self.pitch_deg = -10.0
         self.collisions = 0
+        self.in_contact = False
         self.flash = 0.0
         self.wp = 0
         self.reset()
@@ -98,20 +99,29 @@ class Session:
 
     # ---------------------------------------------------------------- stepping
     def step_manual(self, sticks, dt, noclip=False):
+        """Same contact test as BatchEnv (swept sub-steps vs drone radius 0.25 m against the scene ESDF).
+        Normal mode blocks and bounces; explore (noclip) passes through but still counts and flashes.
+        A hit is counted once per contact (edge), not every frame spent touching."""
         n = max(1, min(6, round(dt * 30)))
         a = torch.tensor([sticks], device=self.dev, dtype=torch.float32)
+        touching = False
         for _ in range(n):
             prev = self.dyn.pos.clone()
             subs = self.dyn.step(a)
-            if noclip:
-                continue
             sdf = self.scene.esdf.query(torch.cat(subs)).min()
-            if sdf < 0.25 or not self.scene.esdf.in_bounds(self.dyn.pos).item():
-                self.dyn.pos = prev
-                self.dyn.vel = -0.3 * self.dyn.vel  # bounce back a little
-                self.collisions += 1
+            hit = bool(sdf < 0.25) or not self.scene.esdf.in_bounds(self.dyn.pos).item()
+            if hit:
+                touching = True
+                if not self.in_contact:
+                    self.collisions += 1
+                    self.in_contact = True
                 self.flash = time.time()
-                break
+                if not noclip:
+                    self.dyn.pos = prev
+                    self.dyn.vel = -0.3 * self.dyn.vel  # bounce back a little
+                    break
+        if not touching:
+            self.in_contact = False
 
     def step_auto(self, dt):
         self._ensure_env()

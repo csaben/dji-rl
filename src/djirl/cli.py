@@ -31,7 +31,9 @@ def _scene(name_or_path: str):
 
 def _env(args, n=None):
     from .env import BatchEnv, EnvConfig
-    cfg = EnvConfig(num_envs=n or args.envs, render_chunk=args.chunk)
+    cfg = EnvConfig(num_envs=n or args.envs, render_chunk=args.chunk, task=getattr(args, "task", "loop"),
+                    ceiling=getattr(args, "ceiling", 30.0), radius_clip=getattr(args, "radius_clip", 0.0),
+                    full_quality_frac=getattr(args, "full_frac", 1.0))
     return BatchEnv(_scene(args.scene), cfg, device=args.device)
 
 
@@ -177,6 +179,10 @@ def main():
         p.add_argument("--scene", default="synthetic")
         p.set_defaults(f=f)
         if name in ("bench", "train", "rollout"):
+            p.add_argument("--task", choices=["loop", "a2b"], default="loop")
+            p.add_argument("--ceiling", type=float, default=30.0)
+            p.add_argument("--radius-clip", type=float, default=0.0, help="skip gaussians <= N px (2.0 = fast)")
+            p.add_argument("--full-frac", type=float, default=1.0, help="fraction of chunks rendered at full quality")
             p.add_argument("--envs", type=int, default={"bench": 512, "train": 512, "rollout": 1}[name])
         if name == "bench":
             p.add_argument("--steps", type=int, default=20)

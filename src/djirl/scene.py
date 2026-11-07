@@ -170,7 +170,11 @@ def bake_esdf(g: Gaussians, voxel: float = 0.1, pad: float = 2.0, min_opacity: f
         idx = idx[ok]
         occ[idx[:, 0], idx[:, 1], idx[:, 2]] = True
     if min_neighbors > 0:
-        nb = F.conv3d(occ[None, None].float(), torch.ones(1, 1, 3, 3, 3, device=dev), padding=1)[0, 0] - occ.float()
+        # neighbour count via separable box sums in uint8 (a float conv3d on big grids needs 10s of GB)
+        o = occ.to(torch.uint8)
+        for d in range(3):
+            o = o.roll(1, d) + o + o.roll(-1, d)
+        nb = o.to(torch.int16) - occ.to(torch.int16)
         occ &= nb >= min_neighbors
     o = occ.cpu().numpy()
     sdf = (distance_transform_edt(~o) - distance_transform_edt(o)) * voxel
