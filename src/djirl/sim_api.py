@@ -29,6 +29,9 @@ from .scene import Scene, load_scene
 REPO = Path(__file__).resolve().parents[2]
 SPLATS = REPO / "data" / "splats"
 DRONE_R = 0.25
+GROUND_R = 0.4      # m, neighbourhood for the local ground height (max of 3x3 samples)
+GROUND_MAX = 2.0    # m; a takeoff/landing surface this far above the terrain map is a roof/canopy
+TERRAIN_RES, TERRAIN_WIN, TERRAIN_PCT = 1.0, 15, 20  # terrain = 20th percentile of 1 m first-surface heights over 15 m
 COLUMN_START = 1.0  # m above ground where the takeoff/landing column check starts (ignores grass / low clutter)
 
 
@@ -139,37 +142,79 @@ class SimAPI:
         return buf.getvalue()
 
     @torch.no_grad()
+    def _ground(self, s, x, y, alt):
+        """First ESDF<0.05 scanning down from alt (0 if nothing), per point. x,y: [n]."""
+        zs = torch.arange(alt, -3.0, -0.1, device=self.dev)
+        n = len(x)
+        P = torch.stack([x[:, None].expand(n, len(zs)), y[:, None].expand(n, len(zs)), zs[None].expand(n, -1)], -1)
+        hit = self.q(s, P.reshape(-1, 3)).reshape(n, -1) < 0.05
+        return torch.where(hit.any(1), zs[hit.float().argmax(1)], torch.zeros(n, device=self.dev))
+
+    @torch.no_grad()
+    def _terrain_at(self, s, x, y):
+        """Robust terrain height: first-surface heights on a 1 m grid (scanned from the grid top),
+        20th-percentile filtered over 15 m and smoothed; bilinear lookup. Cached per scene."""
+        key = ("terrain", s.name)
+        if key not in self.cache:
+            from scipy.ndimage import gaussian_filter, percentile_filter
+            e = s.esdf
+            lo, hi = e.origin.tolist(), e.upper.tolist()
+            xs = torch.arange(lo[0], hi[0], TERRAIN_RES, device=self.dev)
+            ys = torch.arange(lo[1], hi[1], TERRAIN_RES, device=self.dev)
+            Xg, Yg = torch.meshgrid(xs, ys, indexing="ij")
+            top = min(hi[2], 15.0)
+            gz = torch.cat([self._ground(s, a, b, top) for a, b in zip(Xg.reshape(-1).split(32768), Yg.reshape(-1).split(32768))])
+            g = gz.reshape(Xg.shape).cpu().numpy()
+            t = gaussian_filter(percentile_filter(g, TERRAIN_PCT, size=TERRAIN_WIN), 2.0)
+            self.cache[key] = (torch.tensor(t, device=self.dev, dtype=torch.float32), lo[0], lo[1], len(xs), len(ys))
+        T, x0, y0, nx, ny = self.cache[key]
+        u = ((x - x0) / TERRAIN_RES) / (nx - 1) * 2 - 1
+        v = ((y - y0) / TERRAIN_RES) / (ny - 1) * 2 - 1
+        import torch.nn.functional as F
+        grid = torch.stack([v, u], -1)[None, :, None, :]  # grid_sample x->last dim (y index), y->first (x index)
+        return F.grid_sample(T[None, None], grid, align_corners=True, padding_mode="border")[0, 0, :, 0]
+
+    @torch.no_grad()
     def column_blocked(self, s, X, Y, alt):
-        """Same test as fly(): ground gz = first ESDF<0.05 scanning down from alt; blocked if any
-        z in [gz+COLUMN_START, alt] (0.2 m steps) has ESDF < DRONE_R+0.1. X,Y: same-shape tensors."""
+        """Same test as fly(): local ground gz = the HIGHEST first-surface among a 3x3 neighbourhood
+        (+-GROUND_R m) so grass/shrub fuzz doesn't sit 'above ground'; blocked if any z in
+        [gz+COLUMN_START, alt] (0.2 m steps) has ESDF < DRONE_R+0.1, or the surface is a roof/canopy
+        (gz more than GROUND_MAX above the terrain map, see _terrain_at). X,Y: same-shape tensors."""
         flat_x, flat_y = X.reshape(-1), Y.reshape(-1)
         out = torch.zeros(len(flat_x), dtype=torch.bool, device=self.dev)
         gz_all = torch.zeros(len(flat_x), device=self.dev)
-        zs_down = torch.arange(alt, -3.0, -0.1, device=self.dev)
+        ter_all = torch.zeros(len(flat_x), device=self.dev)
         zs_col = torch.arange(-2.4, alt + 1e-6, 0.2, device=self.dev)
-        for i in range(0, len(flat_x), 65536):
-            x, y = flat_x[i:i + 65536], flat_y[i:i + 65536]
+        offs = [(dx, dy) for dx in (-GROUND_R, 0.0, GROUND_R) for dy in (-GROUND_R, 0.0, GROUND_R)]
+        for i in range(0, len(flat_x), 32768):
+            x, y = flat_x[i:i + 32768], flat_y[i:i + 32768]
             n = len(x)
-            P = torch.stack([x[:, None].expand(n, len(zs_down)), y[:, None].expand(n, len(zs_down)),
-                             zs_down[None].expand(n, -1)], -1)
-            hit = self.q(s, P.reshape(-1, 3)).reshape(n, -1) < 0.05
-            gz = torch.where(hit.any(1), zs_down[hit.float().argmax(1)], torch.zeros(n, device=self.dev))
+            gz = torch.stack([self._ground(s, x + dx, y + dy, alt) for dx, dy in offs], 0).max(0).values
+            terrain = self._terrain_at(s, x, y)
             P = torch.stack([x[:, None].expand(n, len(zs_col)), y[:, None].expand(n, len(zs_col)),
                              zs_col[None].expand(n, -1)], -1)
             sd = self.q(s, P.reshape(-1, 3)).reshape(n, -1)
             in_col = (zs_col[None] >= gz[:, None] + COLUMN_START) & (zs_col[None] <= alt)
-            out[i:i + n] = ((sd < DRONE_R + 0.1) & in_col).any(1)
+            out[i:i + n] = ((sd < DRONE_R + 0.1) & in_col).any(1) | (gz - terrain > GROUND_MAX)
+            ter_all[i:i + n] = terrain
             gz_all[i:i + n] = gz
+        self._last_terrain = ter_all.reshape(X.shape)
         return out.reshape(X.shape), gz_all.reshape(X.shape)
 
     @torch.no_grad()
     def column_png(self, name, alt, px=1024) -> bytes:
+        key = ("col", name, round(float(alt), 2), px)
+        if key in self.cache:
+            return self.cache[key]
         s = self.scene(name)
         X, Y = self._pixel_xy(name, px)
         blocked, _ = self.column_blocked(s, X, Y, float(alt))
         buf = io.BytesIO()
         Image.fromarray(blocked.cpu().numpy().astype("uint8") * 255).save(buf, "PNG")
-        return buf.getvalue()
+        if len(self.cache) > 64:
+            self.cache.clear()
+        self.cache[key] = buf.getvalue()
+        return self.cache[key]
 
     # ------------------------------------------------------------ planning
     @torch.no_grad()
@@ -255,14 +300,18 @@ class SimAPI:
         path, why = self.plan(s, a, b, alt, clear)
         if path is None:
             return {"ok": False, "reason": why}
-        gA = self._ground_z(s, a[0], a[1], alt)
-        gB = self._ground_z(s, b[0], b[1], alt)
+        gA = float(self.column_blocked(s, torch.tensor([[a[0]]], device=self.dev), torch.tensor([[a[1]]], device=self.dev), alt)[1][0, 0])
+        gB = float(self.column_blocked(s, torch.tensor([[b[0]]], device=self.dev), torch.tensor([[b[1]]], device=self.dev), alt)[1][0, 0])
         # columns at A and B must be clear for the climb/descent (same test as the column occupancy mask)
         if tol:
             for nm, (x, y) in (("A", a), ("B", b)):
                 blk, _ = self.column_blocked(s, torch.tensor([[x]], device=self.dev), torch.tensor([[y]], device=self.dev), alt)
                 if bool(blk[0, 0]):
-                    return {"ok": False, "reason": f"vertical column above {nm} is blocked (overhang between ground and {alt} m)"}
+                    _, gz = self.column_blocked(s, torch.tensor([[x]], device=self.dev), torch.tensor([[y]], device=self.dev), alt)
+                    above = float(gz[0, 0]) - float(self._last_terrain[0, 0])
+                    why = (f"{nm} is on a roof/canopy ({above:.1f} m above the terrain)" if above > GROUND_MAX
+                           else f"vertical column above {nm} is blocked (overhang between ground and {alt} m)")
+                    return {"ok": False, "reason": why}
         P = StickParams(dr=0.0, wind_std=0.3 if wind else 0.0)
         dyn = StickDynamics(1, P, self.dev, control_dt=0.1, substeps=5)
         start = torch.tensor([[a[0], a[1], (gA + 0.35) if tol else alt]], device=self.dev)

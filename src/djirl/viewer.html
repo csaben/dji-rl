@@ -96,7 +96,7 @@ const view = $("view"), ctx = view.getContext("2d");
 let viewMode = "hd", pitch = -10, scale = 0.6, info = null, state = null;
 let noclip = new URLSearchParams(location.search).get("explore") === "1";
 const replayId = new URLSearchParams(location.search).get("replay");
-let cam = replayId ? "chase" : "fpv", paused = false, scrubbing = false;
+let cam = new URLSearchParams(location.search).get("cam") || (replayId ? "chase" : "fpv"), paused = false, scrubbing = false;
 const keys = new Set();
 const stick = { f: 0, r: 0, u: 0, y: 0 };
 
@@ -219,6 +219,7 @@ async function loop() {
 }
 if (replayId) {
   $("replayBox").hidden = false;
+  for (const b of $("camSeg").children) b.classList.toggle("on", b.dataset.c === cam);
   $("camSeg").onclick = (e) => { if (!e.target.dataset.c) return; cam = e.target.dataset.c;
     for (const b of $("camSeg").children) b.classList.toggle("on", b.dataset.c === cam); };
   $("playBtn").onclick = async () => {
