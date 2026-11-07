@@ -101,6 +101,9 @@ def train(env: BatchEnv, run_dir: Path, cfg: PPOConfig, meta: dict | None = None
         stats.setdefault(k, []).append(float(v))
 
     while it < cfg.max_iters and (time.time() - t0) < cfg.minutes * 60:
+        if hasattr(env, "resample_obstacles") and env.cfg.task == "route" and it > 0 and it % 10 == 0:
+            env.resample_obstacles()   # new unmapped obstacles: no memorising; restart episodes cleanly
+            obs = env.reset()
         model.eval()
         for t in range(T):
             o = _slice(obs, slice(None))
@@ -118,7 +121,8 @@ def train(env: BatchEnv, run_dir: Path, cfg: PPOConfig, meta: dict | None = None
             log_stat("speed", info["speed"].mean())
             log_stat("collide_rate", info["collided"].float().mean())
             if "final_return" in info:
-                for k in ("final_return", "final_length", "final_waypoints", "final_collided", "final_success"):
+                for k in ("final_return", "final_length", "final_waypoints", "final_collided", "final_success",
+                          "final_success_obstacle", "final_collided_obstacle"):
                     if k in info:
                         stats.setdefault(k, []).extend(info[k].tolist())
         with torch.no_grad():

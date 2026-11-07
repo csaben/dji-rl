@@ -45,7 +45,7 @@ class EnvConfig:
     render_chunk: int = 128
     radius_clip: float = 0.0       # see Renderer; 2.0 for big scenes
     full_quality_frac: float = 1.0
-    hazard_labels: bool = False
+    hazard_labels: bool = False   # add ESDF hazard labels (clearance along velocity, must_brake) to info
     # task: "loop" = fly the scene's waypoint loop; "a2b" = random start -> random goal in free space
     task: str = "loop"
     a2b_min_dist: float = 15.0
@@ -54,7 +54,15 @@ class EnvConfig:
     a2b_clearance: float = 2.0        # starts/goals at least this far from any surface
     a2b_coverage: float = 20.0        # only within this horizontal distance of the capture path (where the splat is good)
     a2b_heading_noise: float = 1.2    # rad, initial yaw = bearing to goal + N(0, this)
-    w_success: float = 20.0   # add ESDF hazard labels (clearance along velocity, must_brake) to info
+    w_success: float = 20.0
+    # task "route": follow map-valid A* routes (data/splats/<scene>/routes.pt) toward a carrot point,
+    # with unmapped obstacles injected on them (rendered + collidable) that the policy must dodge
+    route_carrot_m: float = 6.0
+    route_obstacles: int = 24
+    route_obstacle_frac: float = 0.7      # episodes that start just before an injected obstacle
+    route_xtrack_free: float = 1.5        # m off-route before a penalty applies (dodging is allowed)
+    w_xtrack: float = 0.05
+    route_seg_m: tuple = (15.0, 35.0)     # segment length for obstacle-free episodes
     stick: StickParams = field(default_factory=StickParams)
 
 
@@ -78,6 +86,9 @@ class BatchEnv:
         self.ep_success = torch.zeros(n, device=self.dev)
         if cfg.task == "a2b":
             self.cands = self._a2b_candidates()
+        self.obst = None
+        if cfg.task == "route":
+            self._route_init()
         self.t = torch.zeros(n, dtype=torch.long, device=self.dev)
         self.prev_dist = torch.zeros(n, device=self.dev)
         self.last_action = torch.zeros(n, 4, device=self.dev)
@@ -93,10 +104,97 @@ class BatchEnv:
 
     # ------------------------------------------------------------ helpers
     def _sdf(self, p):
-        return self.s.esdf.query(p)
+        d = self.s.esdf.query(p)
+        if self.obst is not None and self.obst.n:
+            d = torch.minimum(d, self.obst.sdf(p))
+        return d
 
     def _goal(self):
-        return self.goal if self.cfg.task == "a2b" else self.wps[self.target]
+        return self.goal if self.cfg.task in ("a2b", "route") else self.wps[self.target]
+
+    # ------------------------------------------------------------ route task
+    def _route_init(self):
+        from pathlib import Path
+
+        from .obstacles import Obstacles
+        f = Path(__file__).resolve().parents[2] / "data" / "splats" / self.s.name / "routes.pt"
+        if not f.exists():
+            raise FileNotFoundError(f"{f} missing: run `djirl routes --scene {self.s.name}` first")
+        R = torch.load(f)
+        self.rpts, self.rlen = R["pts"].to(self.dev), R["len"].to(self.dev)
+        self.rsp = float(R["spacing"])
+        n = self.n
+        self.r_id = torch.zeros(n, dtype=torch.long, device=self.dev)
+        self.r_idx = torch.zeros(n, dtype=torch.long, device=self.dev)
+        self.r_end = torch.zeros(n, dtype=torch.long, device=self.dev)
+        self.r_has_obst = torch.zeros(n, dtype=torch.bool, device=self.dev)
+        self.obst = Obstacles(self.dev)
+        self.resample_obstacles()
+        print(f"route task: {len(self.rpts)} routes, {self.obst.n} unmapped obstacles", flush=True)
+
+    @torch.no_grad()
+    def resample_obstacles(self, seed=None):
+        """Place K unmapped obstacles on random routes (25-75% along); renderer gets the merged splat."""
+        from .obstacles import merge
+        g = torch.Generator(device=self.dev)
+        g.manual_seed(int(seed if seed is not None else torch.randint(0, 2**31, ()).item()))
+        K, Rn = self.cfg.route_obstacles, len(self.rpts)
+        r = torch.randint(0, Rn, (K,), device=self.dev, generator=g)
+        L = self.rlen[r]
+        idx = (L.float() * (0.25 + 0.5 * torch.rand(K, device=self.dev, generator=g))).long()
+        c = self.rpts[r, idx]
+        # ground under each obstacle: first scene-ESDF surface scanning down from the route altitude
+        zs = torch.arange(0, 1, 0.01, device=self.dev)[None] * (c[:, 2:3] + 3.0)
+        col = torch.stack([c[:, None, 0].expand(-1, zs.shape[1]), c[:, None, 1].expand(-1, zs.shape[1]),
+                           c[:, 2:3] - zs], -1)
+        hit = self.s.esdf.query(col.reshape(-1, 3)).reshape(K, -1) < 0.05
+        ground = torch.where(hit.any(1), col[torch.arange(K), hit.float().argmax(1), 2], torch.zeros(K, device=self.dev))
+        self.obst.sample_at(c[:, :2], c[:, 2], ground, gen=g)
+        self.ob_route, self.ob_idx = r, idx
+        self.renderer.g = merge(self.s.gaussians, self.obst.gauss)
+
+    def _spawn_route(self, idx):
+        cfg, m, dev = self.cfg, len(idx), self.dev
+        sp = self.rsp
+        use_ob = torch.rand(m, device=dev) < cfg.route_obstacle_frac
+        k = torch.randint(0, self.obst.n, (m,), device=dev)
+        r_ob, i_ob = self.ob_route[k], self.ob_idx[k]
+        r_rand = torch.randint(0, len(self.rpts), (m,), device=dev)
+        r = torch.where(use_ob, r_ob, r_rand)
+        L = self.rlen[r]
+        lead = ((8 + 10 * torch.rand(m, device=dev)) / sp).long()          # start 8-18 m before the obstacle
+        tail = ((10 + 10 * torch.rand(m, device=dev)) / sp).long()         # and end 10-20 m after it
+        s0_ob = (i_ob - lead).clamp(min=0)
+        e_ob = torch.minimum(i_ob + tail, L - 1)
+        seg = ((cfg.route_seg_m[0] + (cfg.route_seg_m[1] - cfg.route_seg_m[0]) * torch.rand(m, device=dev)) / sp).long()
+        s0_r = (torch.rand(m, device=dev) * (L - seg).clamp(min=1).float()).long()
+        e_r = torch.minimum(s0_r + seg, L - 1)
+        s0 = torch.where(use_ob, s0_ob, s0_r)
+        e = torch.where(use_ob, e_ob, e_r)
+        p = self.rpts[r, s0].clone()
+        nxt = self.rpts[r, torch.minimum(s0 + 4, L - 1)]
+        tan = nxt - p
+        yaw = torch.atan2(tan[:, 1], tan[:, 0]) + torch.randn(m, device=dev) * 0.25
+        p[:, :2] += torch.randn(m, 2, device=dev) * 0.4
+        speed0 = torch.rand(m, device=dev) * 4.0                            # often already moving, like mid-route
+        v0 = torch.stack([torch.cos(yaw), torch.sin(yaw), torch.zeros_like(yaw)], -1) * speed0[:, None]
+        return p, yaw, v0, r, s0, e, use_ob
+
+    def _route_progress(self):
+        """Advance each env's nearest route index within a forward window; returns (idx, xtrack)."""
+        W = 24
+        off = torch.arange(-2, W, device=self.dev)
+        cand = (self.r_idx[:, None] + off[None]).clamp(min=0)
+        cand = torch.minimum(cand, (self.rlen[self.r_id] - 1)[:, None])
+        pts = self.rpts[self.r_id[:, None], cand]
+        d = (pts - self.dyn.pos[:, None]).norm(dim=-1)
+        j = d.argmin(1)
+        new = cand[torch.arange(self.n, device=self.dev), j]
+        return torch.maximum(new, self.r_idx), d.min(1).values
+
+    def _route_carrot(self):
+        ci = torch.minimum(self.r_idx + int(self.cfg.route_carrot_m / self.rsp), self.r_end)
+        return self.rpts[self.r_id, ci]
 
     def _a2b_candidates(self):
         """Free-space points (1 m grid) at flight altitudes, near the capture path (scene waypoints are
@@ -170,6 +268,20 @@ class BatchEnv:
     def _reset_idx(self, idx):
         if len(idx) == 0:
             return
+        if self.cfg.task == "route":
+            p, yaw, v0, r, s0, e, use_ob = self._spawn_route(idx)
+            self.r_id[idx], self.r_idx[idx], self.r_end[idx], self.r_has_obst[idx] = r, s0, e, use_ob
+            self.dyn.reset(idx, p, yaw, v0)
+            self.goal[idx] = self._route_carrot()[idx]
+            self.ep_success[idx] = 0
+            self.target[idx] = 0
+            self.t[idx] = 0
+            self.prev_dist[idx] = (self.r_idx[idx] * self.rsp).float()   # route task: prev arc length
+            self.last_action[idx] = 0
+            self.has_height[idx] = torch.rand(len(idx), device=self.dev) < self.cfg.height_available
+            self.ep_return[idx] = 0
+            self.ep_wps[idx] = 0
+            return
         if self.cfg.task == "a2b":
             p, yaw, v0, goal = self._spawn_a2b(idx)
             self.goal[idx] = goal
@@ -240,11 +352,22 @@ class BatchEnv:
         oob = ~self.s.esdf.in_bounds(pos) | (pos[:, 2] > cfg.ceiling)
         clearance = sdf_sweep.min(1).values
 
-        dist = (self._goal() - pos).norm(dim=-1)
-        progress = self.prev_dist - dist
-        reached = dist < cfg.wp_radius
+        if cfg.task == "route":
+            self.r_idx, xtrack = self._route_progress()
+            arc = (self.r_idx * self.rsp).float()
+            progress = arc - self.prev_dist
+            self.prev_dist = arc
+            self.goal = self._route_carrot()
+            dist = (self.rpts[self.r_id, self.r_end] - pos).norm(dim=-1)
+            reached = (self.r_idx >= self.r_end - 2) & (dist < 2.5)
+        else:
+            dist = (self._goal() - pos).norm(dim=-1)
+            progress = self.prev_dist - dist
+            reached = dist < cfg.wp_radius
         if cfg.task == "a2b":
             self.prev_dist = dist
+        elif cfg.task == "route":
+            pass
         else:
             self.target = torch.where(reached, (self.target + 1) % self.W, self.target)
             self.prev_dist = torch.where(reached, (self._goal() - pos).norm(dim=-1), dist)
@@ -257,7 +380,9 @@ class BatchEnv:
         self.last_action = action
         self.t += 1
         terminated = collided | oob
-        if cfg.task == "a2b":
+        if cfg.task == "route":
+            reward = reward - cfg.w_xtrack * (xtrack - cfg.route_xtrack_free).clamp(min=0)
+        if cfg.task in ("a2b", "route"):
             success = reached & ~collided & ~oob
             reward = reward + cfg.w_success * success.float()
             terminated = terminated | success
@@ -275,6 +400,10 @@ class BatchEnv:
             info["final_waypoints"] = self.ep_wps[done].clone()
             info["final_collided"] = collided[done].float()
             info["final_success"] = self.ep_success[done].clone()
+            if cfg.task == "route":
+                ob = self.r_has_obst[done]
+                info["final_success_obstacle"] = self.ep_success[done][ob].clone()
+                info["final_collided_obstacle"] = collided[done][ob].float()
         if cfg.hazard_labels:  # labels for the post-step state, before autoreset replaces it
             from .hazard import BrakeModel, hazard_labels
             info["hazard"] = hazard_labels(self, getattr(self, "brake", None) or BrakeModel())

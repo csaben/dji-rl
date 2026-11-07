@@ -62,8 +62,11 @@ def hazard_labels(env, brake: BrakeModel) -> dict:
     fwd = torch.stack([torch.cos(dyn.yaw), torch.sin(dyn.yaw), torch.zeros_like(dyn.yaw)], -1)
     vdir = torch.where((speed > 0.3)[:, None], vel / speed.clamp_min(1e-6)[:, None], fwd)
     r = env.cfg.drone_radius
-    clear_vel = ray_clearance(env.s.esdf, dyn.pos, vdir, r)
-    clear_fwd = ray_clearance(env.s.esdf, dyn.pos, fwd, r)
+
+    class _Q:  # env._sdf includes injected unmapped obstacles (route task)
+        query = staticmethod(env._sdf)
+    clear_vel = ray_clearance(_Q, dyn.pos, vdir, r)
+    clear_fwd = ray_clearance(_Q, dyn.pos, fwd, r)
     hits = torch.stack([(clear_vel < speed * T).float() for T in HORIZONS], -1)
     must_brake = (clear_vel < brake.stopping_distance(speed)).float()
     return {"clear_vel": clear_vel, "clear_fwd": clear_fwd, "hit": hits, "must_brake": must_brake, "speed": speed}

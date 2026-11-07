@@ -180,7 +180,7 @@ def main():
         p.add_argument("--scene", default="synthetic")
         p.set_defaults(f=f)
         if name in ("bench", "train", "rollout"):
-            p.add_argument("--task", choices=["loop", "a2b"], default="loop")
+            p.add_argument("--task", choices=["loop", "a2b", "route"], default="loop")
             p.add_argument("--ceiling", type=float, default=30.0)
             p.add_argument("--radius-clip", type=float, default=0.0, help="skip gaussians <= N px (2.0 = fast)")
             p.add_argument("--full-frac", type=float, default=1.0, help="fraction of chunks rendered at full quality")
@@ -196,6 +196,9 @@ def main():
             p.add_argument("--width", type=int, default=640); p.add_argument("--height", type=int, default=480)
         if name == "serve":
             p.add_argument("--host", default="0.0.0.0"); p.add_argument("--port", type=int, default=8965)
+    p = sub.add_parser("routes", parents=[common], help="build the route library for the route task")
+    p.add_argument("--scene", default="house-worldlabs-refined"); p.add_argument("--n", type=int, default=400)
+    p.set_defaults(f=lambda a: __import__("djirl.routes", fromlist=["build"]).build(a.scene, a.n, device=a.device))
     p = sub.add_parser("hazard-collect", parents=[common], help="scripted flights -> hazard training data")
     p.add_argument("--scene", default="synthetic"); p.add_argument("--envs", type=int, default=1024)
     p.add_argument("--frames", type=int, default=1_000_000); p.add_argument("--out"); p.add_argument("--seed", type=int, default=0)
