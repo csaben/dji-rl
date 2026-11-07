@@ -225,7 +225,11 @@ class SimAPI:
         return float(zs[hit[0, 0]]) if len(hit) else 0.0
 
     @torch.no_grad()
-    def plan(self, s, a, b, alt, clear, res=0.5):
+    def plan(self, s, a, b, alt, clear, res=0.5, via=(), via_tol=1.0):
+        """A* per leg (a -> via... -> b) on the ESDF slice at alt with clearance, concatenated, then
+        line-of-sight shortcutting that may cut across a via only if the shortcut passes within
+        via_tol of it. Returns (path [K,3], via_idx [n_via] = index of the path vertex nearest each
+        via, None) or (None, None, reason)."""
         e = s.esdf
         lo, hi = e.origin.tolist(), e.upper.tolist()
         xs = np.arange(lo[0] + res / 2, hi[0], res)
@@ -235,55 +239,84 @@ class SimAPI:
         free = (self.q(s, P).reshape(X.shape) >= clear).cpu().numpy()
         nx, ny = free.shape
         cell = lambda p: (int(round((p[0] - xs[0]) / res)), int(round((p[1] - ys[0]) / res)))
-        sa, sb = cell(a), cell(b)
-        for nm, c in (("A", sa), ("B", sb)):
+        stops = [("A", a)] + [(f"waypoint {i}", v) for i, v in enumerate(via)] + [("B", b)]
+        for nm, p in stops:
+            c = cell(p)
             if not (0 <= c[0] < nx and 0 <= c[1] < ny):
-                return None, f"{nm} is outside the scene bounds"
+                return None, None, f"{nm} is outside the scene bounds"
             if not free[c]:
-                return None, f"{nm} is blocked at {alt} m with {clear} m clearance"
-        # A* (8-connected)
+                return None, None, f"{nm} is blocked at {alt} m with {clear} m clearance"
         nbr = [(1, 0, 1), (-1, 0, 1), (0, 1, 1), (0, -1, 1), (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414)]
-        h = lambda c: math.hypot(c[0] - sb[0], c[1] - sb[1])
-        openq = [(h(sa), 0.0, sa)]
-        g = {sa: 0.0}
-        parent = {}
-        closed = set()
-        while openq:
-            _, gc, c = heapq.heappop(openq)
-            if c == sb:
-                break
-            if c in closed:
-                continue
-            closed.add(c)
-            for dx, dy, w in nbr:
-                n = (c[0] + dx, c[1] + dy)
-                if not (0 <= n[0] < nx and 0 <= n[1] < ny) or not free[n]:
+
+        def astar(sa, sb):
+            h = lambda c: math.hypot(c[0] - sb[0], c[1] - sb[1])
+            openq, g, parent, closed = [(h(sa), 0.0, sa)], {sa: 0.0}, {}, set()
+            while openq:
+                _, gc, c = heapq.heappop(openq)
+                if c == sb:
+                    break
+                if c in closed:
                     continue
-                ng = gc + w
-                if ng < g.get(n, 1e18):
-                    g[n], parent[n] = ng, c
-                    heapq.heappush(openq, (ng + h(n), ng, n))
-        if sb not in parent and sa != sb:
-            return None, f"no path at {alt} m with {clear} m clearance"
-        cells = [sb]
-        while cells[-1] != sa:
-            cells.append(parent[cells[-1]])
-        cells.reverse()
-        pts = [np.array([xs[c[0]], ys[c[1]], alt]) for c in cells]
-        pts[0], pts[-1] = np.array([a[0], a[1], alt]), np.array([b[0], b[1], alt])
-        # shortcut smoothing: keep the farthest visible point (ESDF line-of-sight with clearance)
+                closed.add(c)
+                for dx, dy, w in nbr:
+                    n = (c[0] + dx, c[1] + dy)
+                    if not (0 <= n[0] < nx and 0 <= n[1] < ny) or not free[n]:
+                        continue
+                    ng = gc + w
+                    if ng < g.get(n, 1e18):
+                        g[n], parent[n] = ng, c
+                        heapq.heappush(openq, (ng + h(n), ng, n))
+            if sb != sa and sb not in parent:
+                return None
+            cells = [sb]
+            while cells[-1] != sa:
+                cells.append(parent[cells[-1]])
+            return cells[::-1]
+
+        pts, anchor = [], []  # anchor[k] = dense index of stop k
+        for k in range(len(stops) - 1):
+            cells = astar(cell(stops[k][1]), cell(stops[k + 1][1]))
+            if cells is None:
+                return None, None, f"no path from {stops[k][0]} to {stops[k + 1][0]} at {alt} m with {clear} m clearance"
+            seg = [np.array([xs[c[0]], ys[c[1]], alt]) for c in cells]
+            seg[0] = np.array([stops[k][1][0], stops[k][1][1], alt])
+            seg[-1] = np.array([stops[k + 1][1][0], stops[k + 1][1][1], alt])
+            if k == 0:
+                anchor.append(0)
+                pts.extend(seg)
+            else:
+                pts.extend(seg[1:])
+            anchor.append(len(pts) - 1)
+        via_dense = anchor[1:-1]
+
         def visible(p, q):
             n = max(2, int(np.linalg.norm(q - p) / 0.2))
             seg = torch.tensor(np.linspace(p, q, n), dtype=torch.float32, device=self.dev)
             return bool((self.q(s, seg) >= clear * 0.9).all())
-        out, i = [pts[0]], 0
+
+        def near_vias(i, j):
+            for vi in via_dense:
+                if i < vi < j:
+                    p, q, v = pts[i][:2], pts[j][:2], pts[vi][:2]
+                    ab = q - p
+                    t = float(np.clip((v - p) @ ab / (ab @ ab + 1e-9), 0, 1))
+                    if np.linalg.norm(p + t * ab - v) > via_tol:
+                        return False
+            return True
+
+        out, keep_idx, i = [pts[0]], [0], 0
         while i < len(pts) - 1:
             j = len(pts) - 1
-            while j > i + 1 and not visible(pts[i], pts[j]):
+            while j > i + 1 and not (near_vias(i, j) and visible(pts[i], pts[j])):
                 j -= 1
             out.append(pts[j])
+            keep_idx.append(j)
             i = j
-        return np.array(out), None
+        out = np.array(out)
+        via_idx = []
+        for vi in via_dense:  # smoothed vertex closest to each via (vias may have been cut within tolerance)
+            via_idx.append(int(np.argmin(np.linalg.norm(out[:, :2] - pts[vi][:2], axis=1))))
+        return out, via_idx, None
 
     # ------------------------------------------------------------ fly
     @torch.no_grad()
@@ -297,9 +330,10 @@ class SimAPI:
         clear = float(req.get("clear_m", 1.5))
         tol = bool(req.get("takeoff_land", True))
         wind = bool(req.get("wind", False))
-        path, why = self.plan(s, a, b, alt, clear)
+        via = [(float(v["x"]), float(v["y"])) for v in (req.get("via") or [])]
+        path, via_idx, why = self.plan(s, a, b, alt, clear, via=via)
         if path is None:
-            return {"ok": False, "reason": why}
+            return {"ok": False, "reason": why, "via": [{"x": x, "y": y} for x, y in via]}
         gA = float(self.column_blocked(s, torch.tensor([[a[0]]], device=self.dev), torch.tensor([[a[1]]], device=self.dev), alt)[1][0, 0])
         gB = float(self.column_blocked(s, torch.tensor([[b[0]]], device=self.dev), torch.tensor([[b[1]]], device=self.dev), alt)[1][0, 0])
         # columns at A and B must be clear for the climb/descent (same test as the column occupancy mask)
@@ -333,7 +367,7 @@ class SimAPI:
         if style == "fpv":
             a_lat = float(req.get("a_lat", 0.8 * P.a_acc))
             ok_fn = lambda pts: bool((self.q(s, torch.tensor(pts, dtype=torch.float32, device=self.dev)) >= clear * 0.9).all())
-            curve, kappa = fillet_curve(path, speed, a_lat, ok_fn)
+            curve, kappa = fillet_curve(path, speed, a_lat, ok_fn, max_dev={vi: 1.0 for vi in via_idx})
 
             def depart_ok(pos):
                 """climbing departure: >= 2 m up, and the straight climb from here to the curve point
@@ -352,6 +386,12 @@ class SimAPI:
                                     pois=pois, poi_mode=poi_mode)
         traj, collisions, contact, min_clear, touchdown = [], 0, False, 1e9, False
         prev_v = None
+        arc = ArcTracker(path)
+        via_s, start_i = [], 0
+        for k, vi in enumerate(via_idx):  # arc length of each via along the planned path (in order)
+            sv, start_i = arc.arc_of(np.array(via[k]), start=min(start_i, max(vi - 1, 0)))
+            via_s.append(sv)
+        via_reached = [None] * len(via)
         t_max = sum(np.linalg.norm(np.diff(path, axis=0), axis=1)) / max(speed, 0.5) * 3 + 60
         t = 0.0
         reached = False
@@ -361,13 +401,19 @@ class SimAPI:
             yaw = float(dyn.yaw[0])
             cmd, done = ctl.command(pos, vel, yaw)
             clear_now = float(self.q(s, dyn.pos)[0])
+            s_drone = arc.update(pos[:2])
+            for k, sv in enumerate(via_s):
+                if via_reached[k] is None and s_drone >= sv - 0.5:
+                    via_reached[k] = round(t, 2)
+            seg_i = sum(1 for r in via_reached if r is not None)
             sp = float(np.linalg.norm(vel[:2]))
             lat_acc = 0.0 if prev_v is None or sp < 0.2 else abs(float(vel[0] * (vel[1] - prev_v[1]) - vel[1] * (vel[0] - prev_v[0]))) / sp / 0.1
             traj.append({"t": round(t, 2), "x": round(float(pos[0]), 3), "y": round(float(pos[1]), 3), "z": round(float(pos[2]), 3),
                          "vx": round(float(vel[0]), 3), "vy": round(float(vel[1]), 3), "vz": round(float(vel[2]), 3),
                          "yaw": round(yaw, 4), "cmd": [round(float(c), 3) for c in cmd], "clear": round(clear_now, 3),
                          "gimbal_pitch_deg": round(ctl.gimbal_deg, 2), "poi": ctl.active,
-                         "curvature": round(getattr(ctl, "cur_kappa", 0.0), 4), "lat_acc": round(lat_acc, 3)})
+                         "curvature": round(getattr(ctl, "cur_kappa", 0.0), 4), "lat_acc": round(lat_acc, 3),
+                         "seg": seg_i})
             prev_v = vel
             if done:
                 reached = True
@@ -389,6 +435,7 @@ class SimAPI:
         length = float(sum(math.dist((p["x"], p["y"], p["z"]), (q["x"], q["y"], q["z"])) for p, q in zip(traj, traj[1:])))
         out = {"ok": True, "id": tid, "scene": name, "path": [[round(float(v), 3) for v in p] for p in path], "traj": traj,
                "pois": pois, "poi_mode": poi_mode, "style": style,
+               "via": [{"x": x, "y": y} for x, y in via], "via_reached": via_reached,
                **({"curve": [[round(float(v), 3) for v in p] for p in curve[::4]]} if style == "fpv" else {}),
                "length_m": round(length, 2), "duration_s": round(t, 2), "min_clear_m": round(min_clear, 3),
                "collisions": collisions, "touchdown": touchdown, "reached": reached, "final_err_m": round(float(np.linalg.norm(final - np.array(b))), 3)}
@@ -396,6 +443,40 @@ class SimAPI:
         while len(self.trajs) > 20:
             self.trajs.popitem(last=False)
         return out
+
+
+class ArcTracker:
+    """Monotone arc-length progress of the drone along a polyline (safe for loops where B == A)."""
+
+    def __init__(self, path):
+        self.p = np.asarray(path)[:, :2]
+        seg = np.linalg.norm(np.diff(self.p, axis=0), axis=1)
+        self.cum = np.r_[0, np.cumsum(seg)]
+        self.i = 0
+        self.s = 0.0
+
+    def arc_of(self, xy, start=0):
+        best, bs, bi = 1e18, 0.0, start
+        for i in range(start, len(self.p) - 1):
+            a, b = self.p[i], self.p[i + 1]
+            ab = b - a
+            t = float(np.clip((xy - a) @ ab / (ab @ ab + 1e-9), 0, 1))
+            d = float(np.linalg.norm(a + t * ab - xy))
+            if d < best - 1e-9:
+                best, bs, bi = d, self.cum[i] + t * (self.cum[i + 1] - self.cum[i]), i
+        return bs, bi
+
+    def update(self, xy):
+        best, bs, bi = 1e18, self.s, self.i
+        for i in range(self.i, min(self.i + 3, len(self.p) - 1)):
+            a, b = self.p[i], self.p[i + 1]
+            ab = b - a
+            t = float(np.clip((xy - a) @ ab / (ab @ ab + 1e-9), 0, 1))
+            d = float(np.linalg.norm(a + t * ab - xy))
+            if d < best:
+                best, bs, bi = d, self.cum[i] + t * (self.cum[i + 1] - self.cum[i]), i
+        self.i, self.s = bi, max(self.s, bs)
+        return self.s
 
 
 class PursuitController:
@@ -550,7 +631,7 @@ class PursuitController:
 
 # ---------------------------------------------------------------- FPV / fixed-wing style
 
-def fillet_curve(path, speed, a_lat, clear_ok, ds=0.25, r_floor=0.5):
+def fillet_curve(path, speed, a_lat, clear_ok, ds=0.25, r_floor=0.5, max_dev=None):
     """Polyline -> dense curve with circular-arc fillets at interior vertices.
     Nominal radius R = v^2/a_lat, limited by half of each adjacent segment; each fillet is shrunk
     (x0.7) until its samples pass `clear_ok(points[N,3]) -> bool`. Returns (pts [M,3], kappa [M])."""
@@ -568,6 +649,9 @@ def fillet_curve(path, speed, a_lat, clear_ok, ds=0.25, r_floor=0.5):
         if th < 1e-3:
             fillets.append(None); continue
         R = R_nom
+        if max_dev and i in max_dev:  # user waypoint: the arc must pass within max_dev of the vertex
+            sec = 1.0 / max(math.cos(th / 2), 1e-6)
+            R = min(R, max_dev[i] / max(sec - 1.0, 1e-6))
         while True:
             L = R * math.tan(th / 2)
             L_max = 0.5 * min(lu, lw)
@@ -651,7 +735,7 @@ class FpvController:
         if self.phase == "cruise":
             i = self._project(pos[:2])
             spd = float(np.linalg.norm(vel[:2]))
-            look = 1.0 + 0.4 * spd
+            look = 0.5 + 0.4 * spd
             j = int(np.searchsorted(self.s, self.s[i] + look))
             j = min(j, len(self.c) - 1)
             tgt = self.c[j, :2]
