@@ -225,7 +225,7 @@ class SimAPI:
         return float(zs[hit[0, 0]]) if len(hit) else 0.0
 
     @torch.no_grad()
-    def plan(self, s, a, b, alt, clear, res=0.5, via=(), via_tol=1.0):
+    def plan(self, s, a, b, alt, clear, res=0.5, via=(), via_tol=1.0, growth=0.0, origin=None):
         """A* per leg (a -> via... -> b) on the ESDF slice at alt with clearance, concatenated, then
         line-of-sight shortcutting that may cut across a via only if the shortcut passes within
         via_tol of it. Returns (path [K,3], via_idx [n_via] = index of the path vertex nearest each
@@ -236,7 +236,10 @@ class SimAPI:
         ys = np.arange(lo[1] + res / 2, hi[1], res)
         X, Y = np.meshgrid(xs, ys, indexing="ij")
         P = torch.tensor(np.stack([X, Y, np.full_like(X, alt)], -1).reshape(-1, 3), dtype=torch.float32, device=self.dev)
-        free = (self.q(s, P).reshape(X.shape) >= clear).cpu().numpy()
+        ox, oy = origin if origin is not None else a
+        req_c = lambda pts: clear + growth * torch.hypot(pts[..., 0] - ox, pts[..., 1] - oy)  # position-dependent clearance
+        self._req_clear = req_c
+        free = (self.q(s, P) >= req_c(P)).reshape(X.shape).cpu().numpy()
         nx, ny = free.shape
         cell = lambda p: (int(round((p[0] - xs[0]) / res)), int(round((p[1] - ys[0]) / res)))
         stops = [("A", a)] + [(f"waypoint {i}", v) for i, v in enumerate(via)] + [("B", b)]
@@ -245,7 +248,8 @@ class SimAPI:
             if not (0 <= c[0] < nx and 0 <= c[1] < ny):
                 return None, None, f"{nm} is outside the scene bounds"
             if not free[c]:
-                return None, None, f"{nm} is blocked at {alt} m with {clear} m clearance"
+                need = clear + growth * math.hypot(p[0] - ox, p[1] - oy)
+                return None, None, f"{nm} is blocked at {alt} m with {need:.2f} m clearance"
         nbr = [(1, 0, 1), (-1, 0, 1), (0, 1, 1), (0, -1, 1), (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414)]
 
         def astar(sa, sb):
@@ -277,7 +281,8 @@ class SimAPI:
         for k in range(len(stops) - 1):
             cells = astar(cell(stops[k][1]), cell(stops[k + 1][1]))
             if cells is None:
-                return None, None, f"no path from {stops[k][0]} to {stops[k + 1][0]} at {alt} m with {clear} m clearance"
+                return None, None, (f"no path from {stops[k][0]} to {stops[k + 1][0]} at {alt} m with {clear} m clearance"
+                                    + (f" + {growth} m per m from origin" if growth else ""))
             seg = [np.array([xs[c[0]], ys[c[1]], alt]) for c in cells]
             seg[0] = np.array([stops[k][1][0], stops[k][1][1], alt])
             seg[-1] = np.array([stops[k + 1][1][0], stops[k + 1][1][1], alt])
@@ -292,7 +297,7 @@ class SimAPI:
         def visible(p, q):
             n = max(2, int(np.linalg.norm(q - p) / 0.2))
             seg = torch.tensor(np.linspace(p, q, n), dtype=torch.float32, device=self.dev)
-            return bool((self.q(s, seg) >= clear * 0.9).all())
+            return bool((self.q(s, seg) >= req_c(seg)).all())
 
         def near_vias(i, j):
             for vi in via_dense:
@@ -331,9 +336,14 @@ class SimAPI:
         tol = bool(req.get("takeoff_land", True))
         wind = bool(req.get("wind", False))
         via = [(float(v["x"]), float(v["y"])) for v in (req.get("via") or [])]
-        path, via_idx, why = self.plan(s, a, b, alt, clear, via=via)
+        growth = float(req.get("clear_growth_per_m", 0.0) or 0.0)
+        co = req.get("clear_origin") or {"x": a[0], "y": a[1]}
+        origin = (float(co["x"]), float(co["y"]))
+        path, via_idx, why = self.plan(s, a, b, alt, clear, via=via, growth=growth, origin=origin)
         if path is None:
-            return {"ok": False, "reason": why, "via": [{"x": x, "y": y} for x, y in via]}
+            return {"ok": False, "reason": why, "via": [{"x": x, "y": y} for x, y in via],
+                    "clear_growth_per_m": growth, "clear_origin": {"x": origin[0], "y": origin[1]}}
+        req_c = self._req_clear
         gA = float(self.column_blocked(s, torch.tensor([[a[0]]], device=self.dev), torch.tensor([[a[1]]], device=self.dev), alt)[1][0, 0])
         gB = float(self.column_blocked(s, torch.tensor([[b[0]]], device=self.dev), torch.tensor([[b[1]]], device=self.dev), alt)[1][0, 0])
         # columns at A and B must be clear for the climb/descent (same test as the column occupancy mask)
@@ -366,7 +376,9 @@ class SimAPI:
             return {"ok": False, "reason": f"flight_style must be 'normal' or 'fpv', got {style!r}"}
         if style == "fpv":
             a_lat = float(req.get("a_lat", 0.8 * P.a_acc))
-            ok_fn = lambda pts: bool((self.q(s, torch.tensor(pts, dtype=torch.float32, device=self.dev)) >= clear * 0.9).all())
+            def ok_fn(pts):
+                T = torch.tensor(pts, dtype=torch.float32, device=self.dev)
+                return bool((self.q(s, T) >= req_c(T)).all())
             curve, kappa = fillet_curve(path, speed, a_lat, ok_fn, max_dev={vi: 1.0 for vi in via_idx})
 
             def depart_ok(pos):
@@ -376,7 +388,8 @@ class SimAPI:
                     return False
                 j = min(len(curve) - 1, int(10.0 / 0.25))
                 seg = np.linspace(pos, curve[j], 40)
-                return bool((self.q(s, torch.tensor(seg, dtype=torch.float32, device=self.dev)) >= clear).all())
+                T = torch.tensor(seg, dtype=torch.float32, device=self.dev)
+                return bool((self.q(s, T) >= req_c(T)).all())
 
             ctl = FpvController(curve, kappa, alt, speed, P, gB + 0.35 if tol else None, (a[0], a[1]), a_lat,
                                 float(req.get("fpv_gimbal_deg", -10.0)), depart_ok if tol else (lambda p: False))
@@ -386,6 +399,7 @@ class SimAPI:
                                     pois=pois, poi_mode=poi_mode)
         traj, collisions, contact, min_clear, touchdown = [], 0, False, 1e9, False
         prev_v = None
+        min_margin = 1e9
         arc = ArcTracker(path)
         via_s, start_i = [], 0
         for k, vi in enumerate(via_idx):  # arc length of each via along the planned path (in order)
@@ -422,6 +436,8 @@ class SimAPI:
             sd = self.q(s, torch.cat(subs))
             if ctl.phase == "cruise":  # clearance stat = en-route only (takeoff/landing touch the ground)
                 min_clear = min(min_clear, float(sd.min()))
+                sub_p = torch.cat(subs)
+                min_margin = min(min_margin, float((sd - req_c(sub_p)).min()))
             hit = bool(sd.min() < DRONE_R)
             landing = tol and ctl.phase in ("descend", "done") and float(dyn.pos[0, 2]) - gB < 0.8
             if hit and landing:
@@ -436,6 +452,8 @@ class SimAPI:
         out = {"ok": True, "id": tid, "scene": name, "path": [[round(float(v), 3) for v in p] for p in path], "traj": traj,
                "pois": pois, "poi_mode": poi_mode, "style": style,
                "via": [{"x": x, "y": y} for x, y in via], "via_reached": via_reached,
+               "clear_growth_per_m": growth, "clear_origin": {"x": origin[0], "y": origin[1]},
+               "min_margin_m": round(min_margin, 3) if min_margin < 1e8 else None,
                **({"curve": [[round(float(v), 3) for v in p] for p in curve[::4]]} if style == "fpv" else {}),
                "length_m": round(length, 2), "duration_s": round(t, 2), "min_clear_m": round(min_clear, 3),
                "collisions": collisions, "touchdown": touchdown, "reached": reached, "final_err_m": round(float(np.linalg.norm(final - np.array(b))), 3)}
