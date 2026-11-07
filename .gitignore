@@ -1,0 +1,24 @@
+# secrets (ac proxy token)
+.env
+.env.*
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# data: footage, frames, reconstructions and splats are large; keep only the docs
+data/*
+!data/README.md
+!data/splats/
+data/splats/*
+# small scene metadata is worth versioning (waypoints, transform); the splat/esdf binaries are not
+!data/splats/*/
+data/splats/*/*
+!data/splats/*/scene.json
+data/splats/_src/
+
+# training runs / previews
+runs/
+*.mp4

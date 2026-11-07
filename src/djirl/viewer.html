@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dji-rl flight viewer</title>
+<style>
+  :root { --bg:#0e1013; --panel:#171a1f; --line:#2a2f37; --text:#e6e8eb; --dim:#8b929c; --accent:#5ec2ff; --bad:#ff5d5d; --ok:#6fdc8c; --warn:#ffc35e; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text); font:13px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .app { display:grid; grid-template-columns:minmax(0,1fr) 300px; height:100%; }
+  .stage { position:relative; min-width:0; display:flex; align-items:center; justify-content:center; background:#000; overflow:hidden; }
+  canvas#view { width:100%; height:100%; object-fit:contain; image-rendering:auto; }
+  canvas#view.pixel { image-rendering:pixelated; }
+  .hud { position:absolute; left:12px; top:12px; display:grid; grid-template-columns:auto auto; gap:2px 12px; padding:8px 10px; background:rgba(0,0,0,.55); border-radius:6px; font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace; pointer-events:none; }
+  .hud .k { color:var(--dim); } .bad { color:var(--bad); } .warn { color:var(--warn); } .ok { color:var(--ok); }
+  .banner { position:absolute; top:12px; left:50%; transform:translateX(-50%); padding:4px 10px; border-radius:4px; background:rgba(0,0,0,.55); font-weight:600; letter-spacing:.04em; }
+  .sticks { position:absolute; right:12px; bottom:12px; display:flex; gap:10px; pointer-events:none; }
+  .stick { width:72px; height:72px; border:1px solid rgba(255,255,255,.35); border-radius:50%; position:relative; background:rgba(0,0,0,.35); }
+  .stick i { position:absolute; width:12px; height:12px; margin:-6px 0 0 -6px; border-radius:50%; background:var(--accent); left:50%; top:50%; }
+  .stick span { position:absolute; bottom:-16px; width:100%; text-align:center; color:var(--dim); font-size:10px; }
+  aside { background:var(--panel); border-left:1px solid var(--line); padding:14px; overflow:auto; min-width:0; }
+  h1 { font-size:14px; margin:0 0 12px; }
+  h2 { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:16px 0 6px; }
+  label { display:block; margin:6px 0 2px; color:var(--dim); }
+  select,button,input[type=range] { width:100%; }
+  select,button { background:#20242b; color:var(--text); border:1px solid var(--line); border-radius:5px; padding:6px 8px; font:inherit; }
+  button { cursor:pointer; } button:hover { border-color:var(--accent); }
+  .row { display:flex; gap:6px; } .row > * { flex:1; min-width:0; }
+  .seg button.on { background:var(--accent); color:#000; border-color:var(--accent); }
+  canvas#map { width:100%; aspect-ratio:1; background:#0b0d10; border:1px solid var(--line); border-radius:6px; display:block; }
+  kbd { font:11px ui-monospace,monospace; background:#20242b; border:1px solid var(--line); border-radius:3px; padding:0 4px; }
+  .keys { display:grid; grid-template-columns:auto minmax(0,1fr); gap:3px 8px; color:var(--dim); }
+  .note { color:var(--dim); font-size:12px; }
+  @media (max-width:760px) { .app { grid-template-columns:1fr; grid-template-rows:56vh auto; } aside { border-left:0; border-top:1px solid var(--line); } }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="stage" id="stage">
+    <canvas id="view" tabindex="0"></canvas>
+    <div class="hud" id="hud"></div>
+    <div class="banner" id="banner" hidden></div>
+    <div class="sticks">
+      <div class="stick" id="sL"><i></i><span>up / yaw</span></div>
+      <div class="stick" id="sR"><i></i><span>fwd / right</span></div>
+    </div>
+  </div>
+  <aside>
+    <h1>dji-rl flight viewer</h1>
+    <div class="note">The sim's own camera, stick dynamics and collision grid. What you see in <b>Policy input</b> view is exactly what the policy gets (before the encoder).</div>
+
+    <h2>Camera</h2>
+    <div class="row seg" id="viewSeg"><button data-v="hd" class="on">HD 960×540</button><button data-v="sim">Policy input 128×96</button></div>
+    <label>Gimbal pitch <span id="pitchV">-10°</span></label>
+    <input type="range" id="pitch" min="-90" max="20" value="-10">
+
+    <h2>Pilot</h2>
+    <div class="row seg" id="modeSeg"><button data-m="manual" class="on">Manual</button><button data-m="random">Random</button><button data-m="policy">Policy</button></div>
+    <label>Checkpoint</label>
+    <select id="ckpt"></select>
+    <label>Stick scale <span id="scaleV">60%</span></label>
+    <input type="range" id="scale" min="10" max="100" value="60">
+    <label style="display:flex;gap:6px;align-items:center;margin-top:8px;color:var(--text)"><input type="checkbox" id="noclip" style="width:auto"> Explore: fly through walls (N)</label>
+    <div class="row" style="margin-top:8px"><button id="reset">Reset to home (R)</button></div>
+
+    <h2>Scene</h2>
+    <select id="scene"></select>
+
+    <h2>Map</h2>
+    <canvas id="map" width="300" height="300"></canvas>
+
+    <h2>Controls</h2>
+    <div class="keys">
+      <span><kbd>W</kbd><kbd>S</kbd></span><span>forward / back</span>
+      <span><kbd>A</kbd><kbd>D</kbd></span><span>left / right</span>
+      <span><kbd>Q</kbd><kbd>E</kbd> <kbd>←</kbd><kbd>→</kbd></span><span>yaw</span>
+      <span><kbd>Space</kbd><kbd>Shift</kbd> <kbd>↑</kbd><kbd>↓</kbd></span><span>up / down</span>
+      <span><kbd>V</kbd></span><span>toggle HD / policy input</span>
+      <span><kbd>N</kbd></span><span>toggle explore (no collisions)</span>
+      <span>Gamepad</span><span>Mode 2: left = throttle/yaw, right = pitch/roll</span>
+    </div>
+  </aside>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const view = $("view"), ctx = view.getContext("2d");
+let viewMode = "hd", pitch = -10, scale = 0.6, info = null, state = null;
+let noclip = new URLSearchParams(location.search).get("explore") === "1";
+const keys = new Set();
+const stick = { f: 0, r: 0, u: 0, y: 0 };
+
+addEventListener("keydown", (e) => {
+  if (e.target.tagName === "SELECT") return;
+  keys.add(e.code);
+  if (e.code === "KeyV") setView(viewMode === "hd" ? "sim" : "hd");
+  if (e.code === "KeyR") fetch("/reset");
+  if (e.code === "KeyN") { noclip = !noclip; $("noclip").checked = noclip; }
+  if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
+});
+addEventListener("keyup", (e) => keys.delete(e.code));
+addEventListener("blur", () => keys.clear());
+
+function axis(pos, neg) { return (pos.some((k) => keys.has(k)) ? 1 : 0) - (neg.some((k) => keys.has(k)) ? 1 : 0); }
+function dz(v) { return Math.abs(v) < 0.08 ? 0 : v; }
+function readSticks(dt) {
+  const tgt = {
+    f: axis(["KeyW"], ["KeyS"]), r: axis(["KeyD"], ["KeyA"]),
+    u: axis(["Space", "ArrowUp"], ["ShiftLeft", "ShiftRight", "ArrowDown"]), y: axis(["KeyE", "ArrowRight"], ["KeyQ", "ArrowLeft"]),
+  };
+  const pad = [...(navigator.getGamepads ? navigator.getGamepads() : [])].find((p) => p);
+  if (pad) {
+    tgt.y = tgt.y || dz(pad.axes[0]); tgt.u = tgt.u || -dz(pad.axes[1]);
+    tgt.r = tgt.r || dz(pad.axes[2]); tgt.f = tgt.f || -dz(pad.axes[3]);
+  }
+  const k = Math.min(1, dt * 6); // keyboard ramps like a thumb on a stick
+  for (const c of "fruy") stick[c] += (tgt[c] * scale - stick[c]) * k;
+  $("sL").firstChild.style.cssText = `left:${50 + stick.y * 40}%;top:${50 - stick.u * 40}%`;
+  $("sR").firstChild.style.cssText = `left:${50 + stick.r * 40}%;top:${50 - stick.f * 40}%`;
+}
+
+function setView(v) {
+  viewMode = v;
+  view.classList.toggle("pixel", v === "sim");
+  for (const b of $("viewSeg").children) b.classList.toggle("on", b.dataset.v === v);
+}
+$("viewSeg").onclick = (e) => e.target.dataset.v && setView(e.target.dataset.v);
+$("pitch").oninput = (e) => { pitch = +e.target.value; $("pitchV").textContent = pitch + "°"; };
+$("scale").oninput = (e) => { scale = e.target.value / 100; $("scaleV").textContent = e.target.value + "%"; };
+$("reset").onclick = () => fetch("/reset");
+$("noclip").checked = noclip;
+$("noclip").onchange = (e) => { noclip = e.target.checked; };
+$("modeSeg").onclick = async (e) => {
+  const m = e.target.dataset.m; if (!m) return;
+  if (m === "policy" && !$("ckpt").value) { banner("no checkpoint yet: train one first", 2500); return; }
+  await fetch(`/mode?mode=${m}&ckpt=${encodeURIComponent($("ckpt").value)}`);
+  for (const b of $("modeSeg").children) b.classList.toggle("on", b.dataset.m === m);
+};
+$("scene").onchange = async (e) => { await fetch(`/scene?name=${encodeURIComponent(e.target.value)}`); await loadInfo(); };
+
+let bannerT = 0;
+function banner(text, ms) { const b = $("banner"); b.textContent = text; b.hidden = false; bannerT = performance.now() + ms; }
+
+async function loadInfo() {
+  info = await (await fetch("/info")).json();
+  $("scene").innerHTML = info.scenes.map((s) => `<option ${s === info.scene ? "selected" : ""}>${s}</option>`).join("");
+  $("ckpt").innerHTML = info.policies.length ? info.policies.map((p) => `<option>${p}</option>`).join("") : `<option value="">(none yet)</option>`;
+  for (const b of $("modeSeg").children) b.classList.toggle("on", b.dataset.m === info.mode);
+}
+
+function fmt(v, d = 1) { return v === null || v === undefined ? "–" : (+v).toFixed(d); }
+function drawHud(s, fps) {
+  const cl = s.clearance < 0.5 ? "bad" : s.clearance < 1.5 ? "warn" : "ok";
+  $("hud").innerHTML = [
+    ["mode", s.mode], ["speed", fmt(s.speed) + " m/s"], ["fwd/right/up", s.vel_body.map((v) => fmt(v)).join(" / ")],
+    ["height (down)", s.agl === null ? "out of range" : fmt(s.agl) + " m"], ["clearance", `<span class="${cl}">${fmt(s.clearance, 2)} m</span>`],
+    ["pos ENU", s.pos.map((v) => fmt(v)).join(", ")], ["heading", fmt(s.yaw_deg, 0) + "°"],
+    ["waypoint", `#${s.waypoint} · ${fmt(s.wp_dist)} m`], ["collisions", s.collisions], ["fps", fmt(fps, 0)],
+  ].map(([k, v]) => `<span class="k">${k}</span><span>${v}</span>`).join("");
+}
+
+const map = $("map"), mctx = map.getContext("2d"), trail = [];
+function drawMap(s) {
+  if (!info) return;
+  const W = map.width, wps = info.waypoints;
+  const xs = wps.map((p) => p[0]).concat([s.pos[0]]), ys = wps.map((p) => p[1]).concat([s.pos[1]]);
+  const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+  const span = Math.max(40, Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) * 1.25;
+  const tx = (x) => W / 2 + (x - cx) / span * W, ty = (y) => W / 2 - (y - cy) / span * W;
+  mctx.clearRect(0, 0, W, W);
+  mctx.strokeStyle = "#2a2f37"; mctx.lineWidth = 1;
+  for (let g = Math.ceil((cx - span / 2) / 10) * 10; g < cx + span / 2; g += 10) { mctx.beginPath(); mctx.moveTo(tx(g), 0); mctx.lineTo(tx(g), W); mctx.stroke(); }
+  for (let g = Math.ceil((cy - span / 2) / 10) * 10; g < cy + span / 2; g += 10) { mctx.beginPath(); mctx.moveTo(0, ty(g)); mctx.lineTo(W, ty(g)); mctx.stroke(); }
+  mctx.strokeStyle = "#5ec2ff88"; mctx.lineWidth = 2; mctx.beginPath();
+  wps.concat([wps[0]]).forEach((p, i) => (i ? mctx.lineTo(tx(p[0]), ty(p[1])) : mctx.moveTo(tx(p[0]), ty(p[1])))); mctx.stroke();
+  wps.forEach((p, i) => { mctx.fillStyle = i === s.waypoint ? "#ffc35e" : "#5ec2ff"; mctx.beginPath(); mctx.arc(tx(p[0]), ty(p[1]), 5, 0, 7); mctx.fill(); });
+  trail.push([s.pos[0], s.pos[1]]); if (trail.length > 600) trail.shift();
+  mctx.strokeStyle = "#ffffff55"; mctx.lineWidth = 1; mctx.beginPath();
+  trail.forEach((p, i) => (i ? mctx.lineTo(tx(p[0]), ty(p[1])) : mctx.moveTo(tx(p[0]), ty(p[1])))); mctx.stroke();
+  const a = s.yaw_deg * Math.PI / 180, px = tx(s.pos[0]), py = ty(s.pos[1]);
+  mctx.fillStyle = "#6fdc8c"; mctx.beginPath();
+  mctx.moveTo(px + 9 * Math.cos(a), py - 9 * Math.sin(a));
+  mctx.lineTo(px + 6 * Math.cos(a + 2.5), py - 6 * Math.sin(a + 2.5));
+  mctx.lineTo(px + 6 * Math.cos(a - 2.5), py - 6 * Math.sin(a - 2.5)); mctx.fill();
+}
+
+let last = performance.now(), fps = 0, lastCol = 0;
+async function loop() {
+  for (;;) {
+    const now = performance.now(), dt = (now - last) / 1000; last = now;
+    fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
+    readSticks(dt);
+    try {
+      const q = `f=${stick.f.toFixed(3)}&r=${stick.r.toFixed(3)}&u=${stick.u.toFixed(3)}&y=${stick.y.toFixed(3)}&view=${viewMode}&pitch=${pitch}&noclip=${noclip ? 1 : 0}`;
+      const res = await fetch(`/frame?${q}`);
+      state = JSON.parse(res.headers.get("X-State"));
+      const bmp = await createImageBitmap(await res.blob());
+      if (view.width !== bmp.width) { view.width = bmp.width; view.height = bmp.height; }
+      ctx.drawImage(bmp, 0, 0);
+      drawHud(state, fps); drawMap(state);
+      if (state.collisions > lastCol) banner("COLLISION", 700); lastCol = state.collisions;
+      if (performance.now() > bannerT) $("banner").hidden = true;
+    } catch (err) { banner("server unreachable, retrying…", 1500); await new Promise((r) => setTimeout(r, 1000)); }
+  }
+}
+loadInfo().then(() => { view.focus(); loop(); });
+</script>
+</body>
+</html>
