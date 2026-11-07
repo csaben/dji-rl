@@ -39,21 +39,25 @@ def largest_model(sparse: Path) -> Path:
     return best
 
 
-def load_views(und: Path, downscale: int, device):
+def load_views(und: Path, downscale: int, device, max_side: int = 0):
     r = pycolmap.Reconstruction(und / "sparse")
     views = []
     for img in sorted(r.images.values(), key=lambda i: i.name):
         cam = r.cameras[img.camera_id]
         fx, fy, cx, cy = cam.params[:4] if len(cam.params) >= 4 else (cam.params[0], cam.params[0], cam.params[1], cam.params[2])
         im = Image.open(und / "images" / img.name).convert("RGB")
-        W, H = im.width // downscale, im.height // downscale
+        f = float(downscale)
+        if max_side:
+            f = max(f, max(im.width, im.height) / max_side)
+        W, H = round(im.width / f), round(im.height / f)
         im = im.resize((W, H), Image.BILINEAR)
-        K = torch.tensor([[fx / downscale, 0, cx / downscale], [0, fy / downscale, cy / downscale], [0, 0, 1]], dtype=torch.float32)
+        sx, sy = W / cam.width, H / cam.height
+        K = torch.tensor([[fx * sx, 0, cx * sx], [0, fy * sy, cy * sy], [0, 0, 1]], dtype=torch.float32)
         T = img.cam_from_world() if callable(getattr(img, "cam_from_world", None)) else img.cam_from_world
         M = np.eye(4)
         M[:3, :4] = T.matrix()
         views.append({"name": img.name, "K": K.to(device), "viewmat": torch.tensor(M, dtype=torch.float32, device=device),
-                      "rgb": torch.from_numpy(np.asarray(im)).to(device=device, dtype=torch.float16) / 255, "W": W, "H": H,
+                      "rgb": torch.from_numpy(np.asarray(im).copy()).pin_memory(), "W": W, "H": H,
                       "center": -M[:3, :3].T @ M[:3, 3]})
     pts = np.array([p.xyz for p in r.points3D.values()])
     cols = np.array([p.color for p in r.points3D.values()]) / 255.0
@@ -120,6 +124,52 @@ def robust_sim(src, dst, iters=5, k=2.5):
     return s, R, t, err, keep
 
 
+def level_ground(T, means, opac, cam_enu, iters=400, tol=0.15):
+    """RANSAC a plane through the ground under the cameras; rotate it to z=0 with +z up."""
+    p = (T[:3, :3] @ means.T).T + T[:3, 3]
+    lo, hi = cam_enu[:, :2].min(0) - 15, cam_enu[:, :2].max(0) + 15
+    sel = (opac > 0.5) & (p[:, 0] > lo[0]) & (p[:, 0] < hi[0]) & (p[:, 1] > lo[1]) & (p[:, 1] < hi[1])
+    sel &= p[:, 2] < np.percentile(p[sel, 2], 40)  # ground is the lower layer
+    q = p[sel]
+    if len(q) < 1000:
+        print("ground: too few points, not levelled")
+        return T
+    rng = np.random.default_rng(0)
+    best, bn, bd = 0, None, None
+    for _ in range(iters):
+        a, b, c = q[rng.choice(len(q), 3, replace=False)]
+        n = np.cross(b - a, c - a)
+        if np.linalg.norm(n) < 1e-6:
+            continue
+        n /= np.linalg.norm(n)
+        if n[2] < 0:
+            n = -n
+        if n[2] < 0.8:  # must be roughly horizontal already
+            continue
+        d = -n @ a
+        inl = (np.abs(q @ n + d) < tol).sum()
+        if inl > best:
+            best, bn, bd = inl, n, d
+    if bn is None:
+        print("ground: no plane found, not levelled")
+        return T
+    inl = q[np.abs(q @ bn + bd) < tol]
+    c = inl.mean(0)
+    _, _, vt = np.linalg.svd(inl - c)
+    n = vt[2] if vt[2][2] > 0 else -vt[2]
+    z = np.array([0.0, 0, 1])
+    v, cth = np.cross(n, z), n @ z
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    R = np.eye(3) + vx + vx @ vx / (1 + cth)
+    L = np.eye(4)
+    L[:3, :3] = R
+    L[:3, 3] = -R @ c
+    L[:2, 3] += c[:2]  # keep x,y origin where it was; only level and set ground to z=0
+    tilt = np.degrees(np.arccos(np.clip(cth, -1, 1)))
+    print(f"ground: {best}/{len(q)} inliers, tilt corrected {tilt:.1f} deg, ground was at z={c[2]:.2f} m")
+    return L @ T
+
+
 # ------------------------------------------------------------------ main
 def main():
     ap = argparse.ArgumentParser()
@@ -130,6 +180,8 @@ def main():
     ap.add_argument("--sh-degree", type=int, default=3)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--crop-margin", type=float, default=30.0, help="drop gaussians this far (m) beyond the camera bbox")
+    ap.add_argument("--max-side", type=int, default=0, help="resize so the longest image side is at most this")
+    ap.add_argument("--holdout", type=int, default=20, help="every Nth view is held out for PSNR (0 = none)")
     a = ap.parse_args()
     dev = torch.device(a.device)
     torch.manual_seed(0)
@@ -140,7 +192,7 @@ def main():
     und = a.recon / "undistorted"
     if not (und / "sparse").exists():
         pycolmap.undistort_images(und, model, a.recon / "images")
-    views, pts, cols = load_views(und, a.downscale, dev)
+    views, pts, cols = load_views(und, a.downscale, dev, a.max_side)
     print(f"{len(views)} views at {views[0]['W']}x{views[0]['H']}, {len(pts)} sfm points", flush=True)
 
     centers = np.array([v["center"] for v in views])
@@ -174,9 +226,11 @@ def main():
     strat.check_sanity(params, opts)
     state = strat.initialize_state(scene_scale=scene_scale)
     w = _gauss(device=dev)
+    test = views[::a.holdout] if a.holdout else []
+    train_v = [v for i, v in enumerate(views) if not (a.holdout and i % a.holdout == 0)]
     t0 = time.time()
     for step in range(a.steps):
-        v = views[np.random.randint(len(views))]
+        v = train_v[np.random.randint(len(train_v))]
         deg = min(step // 1000, a.sh_degree)
         colors = torch.cat([params["sh0"], params["shN"]], 1)
         img, alpha, info = rasterization(params["means"], F.normalize(params["quats"], dim=-1), params["scales"].exp(),
@@ -184,7 +238,7 @@ def main():
                                          v["W"], v["H"], sh_degree=deg, packed=False)
         strat.step_pre_backward(params, opts, state, step, info)
         pred = img[0].permute(2, 0, 1)[None]
-        gt = v["rgb"].float().permute(2, 0, 1)[None]
+        gt = v["rgb"].to(dev, non_blocking=True).float().div(255).permute(2, 0, 1)[None]
         loss = 0.8 * (pred - gt).abs().mean() + 0.2 * (1 - ssim(pred, gt, w))
         loss.backward()
         strat.step_post_backward(params, opts, state, step, info, packed=False)
@@ -194,6 +248,17 @@ def main():
         sched.step()
         if step % 500 == 0 or step == a.steps - 1:
             print(f"step {step} loss {loss.item():.4f} gaussians {len(params['means'])} {time.time() - t0:.0f}s", flush=True)
+
+    if test:
+        with torch.no_grad():
+            ps = []
+            for v in test:
+                img, _, _ = rasterization(params["means"], F.normalize(params["quats"], dim=-1), params["scales"].exp(),
+                                          params["opacities"].sigmoid(), torch.cat([params["sh0"], params["shN"]], 1),
+                                          v["viewmat"][None], v["K"][None], v["W"], v["H"], sh_degree=a.sh_degree)
+                gt = v["rgb"].to(dev).float().div(255)
+                ps.append(-10 * torch.log10(((img[0].clamp(0, 1) - gt) ** 2).mean()).item())
+            print(f"held-out PSNR over {len(test)} views: {np.mean(ps):.2f} dB (min {np.min(ps):.2f})", flush=True)
 
     # georeference
     names, enu, origin = gps_targets(views, srcs)
@@ -207,6 +272,8 @@ def main():
               f"residual median {np.median(err[keep]):.2f} m (GPS is ~±11 m at 4 decimals), origin {origin}")
     else:
         print("georef: not enough GPS frames; leaving SfM frame (no metric scale!)")
+    T = level_ground(T, params["means"].detach().cpu().numpy(), params["opacities"].detach().sigmoid().cpu().numpy(),
+                     (T[:3, :3] @ centers.T).T + T[:3, 3])
 
     g = Gaussians(params["means"].detach(), F.normalize(params["quats"].detach(), dim=-1), params["scales"].detach().exp(),
                   params["opacities"].detach().sigmoid(), torch.cat([params["sh0"], params["shN"]], 1).detach())

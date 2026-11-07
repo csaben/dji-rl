@@ -142,12 +142,14 @@ def save_ply(g: Gaussians, path: Path) -> None:
 
 @torch.no_grad()
 def bake_esdf(g: Gaussians, voxel: float = 0.1, pad: float = 2.0, min_opacity: float = 0.3,
-              min_neighbors: int = 2, bounds: tuple | None = None) -> ESDF:
+              min_neighbors: int = 2, bounds: tuple | None = None, max_scale: float | None = None) -> ESDF:
     """Occupancy from opaque Gaussians (centre + points on their 1.5-sigma ellipsoid), isolated-voxel
     (floater) removal, then a signed Euclidean distance transform."""
     from scipy.ndimage import distance_transform_edt
     dev = g.means.device
     keep = g.opacities > min_opacity
+    if max_scale is not None:  # big soft blobs are sky/background/floaters, not surfaces
+        keep &= g.scales.max(-1).values < max_scale
     means, quats, scales = g.means[keep], g.quats[keep], g.scales[keep]
     if bounds is None:
         lo, hi = means.min(0).values - pad, means.max(0).values + pad

@@ -53,7 +53,15 @@ def cmd_import_ply(a):
         T = np.asarray(json.loads(Path(a.transform).read_text()))
         g = g.transformed(T)
     g = g.to(a.device)
-    esdf = bake_esdf(g, voxel=a.voxel)
+    # bound the grid to where the scene actually is: trim outlier gaussians (floaters, far
+    # background) and cap the height, otherwise the distance transform can need 10s of GB
+    m = g.means[g.opacities > 0.3]
+    lo = torch.quantile(m[::max(1, len(m) // 500_000)], 0.01, dim=0) - 5
+    hi = torch.quantile(m[::max(1, len(m) // 500_000)], 0.99, dim=0) + 5
+    lo[2], hi[2] = max(lo[2].item(), -3.0), min(hi[2].item(), a.max_height)
+    esdf = bake_esdf(g, voxel=a.voxel, bounds=(lo.tolist(), hi.tolist()), min_opacity=a.min_opacity,
+                     min_neighbors=a.min_neighbors, max_scale=a.max_scale)
+    print(f"esdf bounds {[round(x, 1) for x in lo.tolist()]} .. {[round(x, 1) for x in hi.tolist()]}")
     wps = torch.tensor(json.loads(Path(a.waypoints).read_text())) if a.waypoints else torch.zeros(1, 3)
     # save the (already transformed) gaussians with an identity transform
     d = save_scene(Scene(a.name, g, esdf, wps.float()), SPLATS, notes=f"imported from {a.ply}")
@@ -129,6 +137,20 @@ def cmd_rollout(a):
     print(f"-> {a.out} (left: 512x384 view, right: what the policy sees at {env.cfg.width}x{env.cfg.height})")
 
 
+def cmd_hazard_collect(a):
+    from .hazard import BrakeModel, collect
+    env = _env(a)
+    out = Path(a.out) if a.out else REPO / "data" / "hazard" / f"{env.s.name}.pt"
+    collect(env, a.frames, out, BrakeModel(latency=a.latency, a_brake=a.a_brake, margin=a.margin), seed=a.seed)
+
+
+def cmd_hazard_train(a):
+    from .hazard import train_hazard
+    run = RUNS / (a.name or f"hazard-{time.strftime('%Y%m%d-%H%M%S')}")
+    train_hazard(Path(a.data), run, device=a.device, epochs=a.epochs)
+    print(f"done -> {run}/hazard.pt")
+
+
 def cmd_serve(a):
     from .viewer import serve
     serve(_scene(a.scene), host=a.host, port=a.port, device=a.device)
@@ -144,7 +166,12 @@ def main():
     p = sub.add_parser("synth", parents=[common]); p.add_argument("--seed", type=int, default=0); p.set_defaults(f=cmd_synth)
     p = sub.add_parser("import-ply", parents=[common]); p.add_argument("ply"); p.add_argument("--name", required=True)
     p.add_argument("--voxel", type=float, default=0.1); p.add_argument("--waypoints", help="JSON [[x,y,z],...] ENU")
-    p.add_argument("--transform", help="JSON 4x4 splat->ENU similarity"); p.set_defaults(f=cmd_import_ply)
+    p.add_argument("--transform", help="JSON 4x4 splat->ENU similarity")
+    p.add_argument("--max-height", type=float, default=40.0, help="collision grid ceiling (m)")
+    p.add_argument("--min-opacity", type=float, default=0.3, help="gaussians below this don't count as obstacles")
+    p.add_argument("--min-neighbors", type=int, default=2, help="drop isolated occupied voxels (floaters)")
+    p.add_argument("--max-scale", type=float, default=None, help="gaussians larger than this (m) don't count as obstacles")
+    p.set_defaults(f=cmd_import_ply)
     for name, f in (("bench", cmd_bench), ("train", cmd_train), ("rollout", cmd_rollout), ("preview", cmd_preview), ("serve", cmd_serve)):
         p = sub.add_parser(name, parents=[common])
         p.add_argument("--scene", default="synthetic")
@@ -162,6 +189,14 @@ def main():
             p.add_argument("--width", type=int, default=640); p.add_argument("--height", type=int, default=480)
         if name == "serve":
             p.add_argument("--host", default="0.0.0.0"); p.add_argument("--port", type=int, default=8965)
+    p = sub.add_parser("hazard-collect", parents=[common], help="scripted flights -> hazard training data")
+    p.add_argument("--scene", default="synthetic"); p.add_argument("--envs", type=int, default=1024)
+    p.add_argument("--frames", type=int, default=1_000_000); p.add_argument("--out"); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--latency", type=float, default=0.30); p.add_argument("--a-brake", type=float, default=5.0)
+    p.add_argument("--margin", type=float, default=1.5); p.set_defaults(f=cmd_hazard_collect)
+    p = sub.add_parser("hazard-train", parents=[common], help="train the hazard model on collected data")
+    p.add_argument("data"); p.add_argument("--name"); p.add_argument("--epochs", type=int, default=8)
+    p.set_defaults(f=cmd_hazard_train)
     a = ap.parse_args()
     a.f(a)
 

@@ -24,6 +24,8 @@ def main():
     ap.add_argument("--max-features", type=int, default=8192)
     ap.add_argument("--overlap", type=int, default=15)
     ap.add_argument("--camera-model", default="SIMPLE_RADIAL")
+    ap.add_argument("--cross-every", type=int, default=4, help="cross-source/loop pairs use every Nth frame")
+    ap.add_argument("--mapper", choices=["global", "incremental"], default="global")
     a = ap.parse_args()
 
     out = a.out
@@ -58,16 +60,35 @@ def main():
     seq.quadratic_overlap = True
     pycolmap.match_sequential(db, pairing_options=seq)
     print(f"sequential matching: {time.time() - t:.0f}s", flush=True)
-    if len(a.src) > 1:
-        # cross-source pairs: exhaustive over a thinned subset is cheap enough at this scale
-        t = time.time()
-        pycolmap.match_exhaustive(db)
-        print(f"exhaustive matching: {time.time() - t:.0f}s", flush=True)
+    # extra pairs on a thinned subset: every source against every other (drone<->phone), plus
+    # long-range pairs within a source for loop closure (the drone orbits back over itself)
+    t = time.time()
+    by_src = {}
+    for n in names:
+        by_src.setdefault(n.split("/")[0], []).append(n)
+    thin = {k: v[::a.cross_every] for k, v in by_src.items()}
+    pairs = set()
+    ks = list(thin)
+    for i, ka in enumerate(ks):
+        for kb in ks[i:]:
+            for x in thin[ka]:
+                for y in thin[kb]:
+                    if x < y and (ka != kb or abs(by_src[ka].index(x) - by_src[ka].index(y)) > a.overlap):
+                        pairs.add((x, y))
+    pf = out / "pairs.txt"
+    pf.write_text("".join(f"{x} {y}\n" for x, y in sorted(pairs)))
+    imp = pycolmap.ImportedPairingOptions()
+    imp.match_list_path = pf
+    pycolmap.match_image_pairs(db, pairing_options=imp)
+    print(f"cross/loop matching ({len(pairs)} pairs): {time.time() - t:.0f}s", flush=True)
 
     t = time.time()
     sparse = out / "sparse"
     sparse.mkdir(exist_ok=True)
-    maps = pycolmap.incremental_mapping(db, img_root, sparse)
+    if a.mapper == "global":
+        maps = pycolmap.global_mapping(db, img_root, sparse)
+    else:
+        maps = pycolmap.incremental_mapping(db, img_root, sparse)
     print(f"mapping: {time.time() - t:.0f}s", flush=True)
     for k, m in sorted(maps.items(), key=lambda kv: -kv[1].num_reg_images()):
         print(f"model {k}: {m.num_reg_images()}/{len(names)} images, {m.num_points3D()} points, "

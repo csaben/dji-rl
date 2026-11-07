@@ -43,6 +43,7 @@ class EnvConfig:
     w_smooth: float = 0.02
     w_alive: float = 0.0
     render_chunk: int = 128
+    hazard_labels: bool = False   # add ESDF hazard labels (clearance along velocity, must_brake) to info
     stick: StickParams = field(default_factory=StickParams)
 
 
@@ -198,6 +199,9 @@ class BatchEnv:
             info["final_length"] = self.t[done].float().clone()
             info["final_waypoints"] = self.ep_wps[done].clone()
             info["final_collided"] = collided[done].float()
+        if cfg.hazard_labels:  # labels for the post-step state, before autoreset replaces it
+            from .hazard import BrakeModel, hazard_labels
+            info["hazard"] = hazard_labels(self, getattr(self, "brake", None) or BrakeModel())
         self._reset_idx(done.nonzero()[:, 0])
         obs = self._obs(reset_mask=done)
         return obs, reward, done, info
