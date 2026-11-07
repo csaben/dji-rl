@@ -327,9 +327,31 @@ class SimAPI:
         poi_mode = req.get("poi_mode", "nearest")
         if poi_mode not in ("nearest", "sequence"):
             return {"ok": False, "reason": f"poi_mode must be 'nearest' or 'sequence', got {poi_mode!r}"}
-        ctl = PursuitController(path, alt, speed, P, gB + 0.35 if tol else None, (a[0], a[1]),
-                                pois=pois, poi_mode=poi_mode)
+        style = req.get("flight_style", "normal")
+        if style not in ("normal", "fpv"):
+            return {"ok": False, "reason": f"flight_style must be 'normal' or 'fpv', got {style!r}"}
+        if style == "fpv":
+            a_lat = float(req.get("a_lat", 0.8 * P.a_acc))
+            ok_fn = lambda pts: bool((self.q(s, torch.tensor(pts, dtype=torch.float32, device=self.dev)) >= clear * 0.9).all())
+            curve, kappa = fillet_curve(path, speed, a_lat, ok_fn)
+
+            def depart_ok(pos):
+                """climbing departure: >= 2 m up, and the straight climb from here to the curve point
+                10 m ahead at cruise altitude keeps clearance"""
+                if pos[2] - gA < 2.0:
+                    return False
+                j = min(len(curve) - 1, int(10.0 / 0.25))
+                seg = np.linspace(pos, curve[j], 40)
+                return bool((self.q(s, torch.tensor(seg, dtype=torch.float32, device=self.dev)) >= clear).all())
+
+            ctl = FpvController(curve, kappa, alt, speed, P, gB + 0.35 if tol else None, (a[0], a[1]), a_lat,
+                                float(req.get("fpv_gimbal_deg", -10.0)), depart_ok if tol else (lambda p: False))
+            pois = []
+        else:
+            ctl = PursuitController(path, alt, speed, P, gB + 0.35 if tol else None, (a[0], a[1]),
+                                    pois=pois, poi_mode=poi_mode)
         traj, collisions, contact, min_clear, touchdown = [], 0, False, 1e9, False
+        prev_v = None
         t_max = sum(np.linalg.norm(np.diff(path, axis=0), axis=1)) / max(speed, 0.5) * 3 + 60
         t = 0.0
         reached = False
@@ -339,10 +361,14 @@ class SimAPI:
             yaw = float(dyn.yaw[0])
             cmd, done = ctl.command(pos, vel, yaw)
             clear_now = float(self.q(s, dyn.pos)[0])
+            sp = float(np.linalg.norm(vel[:2]))
+            lat_acc = 0.0 if prev_v is None or sp < 0.2 else abs(float(vel[0] * (vel[1] - prev_v[1]) - vel[1] * (vel[0] - prev_v[0]))) / sp / 0.1
             traj.append({"t": round(t, 2), "x": round(float(pos[0]), 3), "y": round(float(pos[1]), 3), "z": round(float(pos[2]), 3),
                          "vx": round(float(vel[0]), 3), "vy": round(float(vel[1]), 3), "vz": round(float(vel[2]), 3),
                          "yaw": round(yaw, 4), "cmd": [round(float(c), 3) for c in cmd], "clear": round(clear_now, 3),
-                         "gimbal_pitch_deg": round(ctl.gimbal_deg, 2), "poi": ctl.active})
+                         "gimbal_pitch_deg": round(ctl.gimbal_deg, 2), "poi": ctl.active,
+                         "curvature": round(getattr(ctl, "cur_kappa", 0.0), 4), "lat_acc": round(lat_acc, 3)})
+            prev_v = vel
             if done:
                 reached = True
                 break
@@ -362,7 +388,8 @@ class SimAPI:
         tid = uuid.uuid4().hex[:10]
         length = float(sum(math.dist((p["x"], p["y"], p["z"]), (q["x"], q["y"], q["z"])) for p, q in zip(traj, traj[1:])))
         out = {"ok": True, "id": tid, "scene": name, "path": [[round(float(v), 3) for v in p] for p in path], "traj": traj,
-               "pois": pois, "poi_mode": poi_mode,
+               "pois": pois, "poi_mode": poi_mode, "style": style,
+               **({"curve": [[round(float(v), 3) for v in p] for p in curve[::4]]} if style == "fpv" else {}),
                "length_m": round(length, 2), "duration_s": round(t, 2), "min_clear_m": round(min_clear, 3),
                "collisions": collisions, "touchdown": touchdown, "reached": reached, "final_err_m": round(float(np.linalg.norm(final - np.array(b))), 3)}
         self.trajs[tid] = out
@@ -516,6 +543,151 @@ class PursuitController:
         right = v_xy[0] * s_ - v_xy[1] * c
         err = (want_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
         r = float(np.clip(2.0 * err, -P.yaw_rate_max, P.yaw_rate_max))
+        up = vz / P.v_up_max if vz >= 0 else vz / P.v_down_max
+        return [float(np.clip(fwd / P.v_h_max, -1, 1)), float(np.clip(right / P.v_h_max, -1, 1)),
+                float(np.clip(up, -1, 1)), float(np.clip(-r / P.yaw_rate_max, -1, 1))], False
+
+
+# ---------------------------------------------------------------- FPV / fixed-wing style
+
+def fillet_curve(path, speed, a_lat, clear_ok, ds=0.25, r_floor=0.5):
+    """Polyline -> dense curve with circular-arc fillets at interior vertices.
+    Nominal radius R = v^2/a_lat, limited by half of each adjacent segment; each fillet is shrunk
+    (x0.7) until its samples pass `clear_ok(points[N,3]) -> bool`. Returns (pts [M,3], kappa [M])."""
+    P = np.asarray(path, float)
+    if len(P) < 3:
+        n = max(2, int(np.linalg.norm(P[-1] - P[0]) / ds) + 1)
+        return np.linspace(P[0], P[-1], n), np.zeros(n)
+    R_nom = speed ** 2 / a_lat
+    fillets = []  # (t_in point, t_out point, center, R, turn sign) per interior vertex
+    for i in range(1, len(P) - 1):
+        u = P[i, :2] - P[i - 1, :2]; w = P[i + 1, :2] - P[i, :2]
+        lu, lw = np.linalg.norm(u), np.linalg.norm(w)
+        u, w = u / lu, w / lw
+        th = math.acos(float(np.clip(u @ w, -1, 1)))
+        if th < 1e-3:
+            fillets.append(None); continue
+        R = R_nom
+        while True:
+            L = R * math.tan(th / 2)
+            L_max = 0.5 * min(lu, lw)
+            if L > L_max:
+                R = L_max / math.tan(th / 2); L = L_max
+            t_in, t_out = P[i, :2] - u * L, P[i, :2] + w * L
+            sign = 1.0 if (u[0] * w[1] - u[1] * w[0]) > 0 else -1.0
+            nrm = np.array([-u[1], u[0]]) * sign
+            c = t_in + nrm * R
+            a0 = math.atan2(t_in[1] - c[1], t_in[0] - c[0])
+            arc_n = max(2, int(R * th / ds) + 1)
+            ang = a0 + sign * np.linspace(0, th, arc_n)
+            arc = np.stack([c[0] + R * np.cos(ang), c[1] + R * np.sin(ang), np.full(arc_n, P[i, 2])], 1)
+            if clear_ok(arc) or R <= r_floor:
+                break
+            R *= 0.7
+        fillets.append((t_in, t_out, arc, R, sign))
+    pts, kap = [], []
+    cur = P[0, :2]
+    for i in range(1, len(P)):
+        f = fillets[i - 1] if i - 1 < len(fillets) else None
+        end = f[0] if f is not None else P[i, :2]
+        seg_n = max(2, int(np.linalg.norm(end - cur) / ds) + 1)
+        seg = np.linspace(cur, end, seg_n)
+        pts.append(np.c_[seg, np.full(seg_n, P[i, 2])]); kap.append(np.zeros(seg_n))
+        if f is not None:
+            pts.append(f[2]); kap.append(np.full(len(f[2]), 1.0 / f[3]))
+            cur = f[1]
+        else:
+            cur = P[i, :2]
+    pts = np.concatenate(pts); kap = np.concatenate(kap)
+    keep = np.r_[True, np.linalg.norm(np.diff(pts[:, :2], axis=0), axis=1) > 1e-6]
+    return pts[keep], kap[keep]
+
+
+class FpvController:
+    """Fixed-wing-like tracking of a curvature-limited curve: constant speed except where curvature
+    (lateral accel or yaw-rate limit) or the final stop forces it, yaw always along the velocity
+    tangent, climbing departure when clear. Same action space as PursuitController."""
+
+    def __init__(self, curve, kappa, alt, speed, P: StickParams, land_z, a_xy, a_lat, gimbal_deg, depart_ok):
+        self.c, self.k, self.alt, self.speed, self.P = curve, kappa, alt, speed, P
+        self.land_z, self.a_xy, self.a_lat, self.depart_ok = land_z, np.array(a_xy), a_lat, depart_ok
+        self.gimbal_deg, self.active = gimbal_deg, -1
+        self.phase = "climb"
+        seg = np.linalg.norm(np.diff(curve[:, :2], axis=0), axis=1)
+        self.s = np.r_[0, np.cumsum(seg)]
+        self.total = self.s[-1]
+        k = np.maximum(kappa, 1e-6)
+        vmax = np.minimum.reduce([np.full(len(k), speed), np.sqrt(a_lat / k), 0.9 * P.yaw_rate_max / k])
+        vmax[-1] = 0.0
+        a_f, a_b = 0.8 * P.a_acc, 0.6 * P.a_brake
+        v = vmax.copy()
+        for i in range(1, len(v)):           # forward pass (accel limit)
+            v[i] = min(v[i], math.sqrt(v[i - 1] ** 2 + 2 * a_f * seg[i - 1]))
+        for i in range(len(v) - 2, -1, -1):  # backward pass (brake ahead of time)
+            v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2 * a_b * seg[i]))
+        self.v = v
+        self.idx = 0
+        self.cur_kappa = 0.0
+
+    def _project(self, p):
+        lo, hi = self.idx, min(self.idx + 200, len(self.c))
+        d = np.linalg.norm(self.c[lo:hi, :2] - p, axis=1)
+        self.idx = lo + int(np.argmin(d))
+        return self.idx
+
+    def _vz(self, z, target):
+        return float(np.clip(1.2 * (target - z), -self.P.v_down_max * 0.8, self.P.v_up_max * 0.8))
+
+    def command(self, pos, vel, yaw):
+        P = self.P
+        v_xy, vz, want_yaw, ff_rate = np.zeros(2), 0.0, yaw, 0.0
+        if self.phase == "climb":
+            v_xy = np.clip(1.0 * (self.a_xy - pos[:2]), -1, 1)
+            vz = self._vz(pos[2], self.alt)
+            t0 = self.c[min(4, len(self.c) - 1), :2] - self.c[0, :2]
+            want_yaw = math.atan2(t0[1], t0[0])  # face the first leg while climbing
+            if abs(pos[2] - self.alt) < 0.3 or self.depart_ok(pos):
+                self.phase = "cruise"
+        if self.phase == "cruise":
+            i = self._project(pos[:2])
+            spd = float(np.linalg.norm(vel[:2]))
+            look = 1.0 + 0.4 * spd
+            j = int(np.searchsorted(self.s, self.s[i] + look))
+            j = min(j, len(self.c) - 1)
+            tgt = self.c[j, :2]
+            tan = self.c[min(i + 1, len(self.c) - 1), :2] - self.c[max(i - 1, 0), :2]
+            tan = tan / (np.linalg.norm(tan) + 1e-9)
+            to = tgt - pos[:2]
+            to = to / (np.linalg.norm(to) + 1e-9)
+            vref = float(self.v[min(j, len(self.v) - 1)])
+            rem_now = self.total - self.s[i]
+            vref = max(vref, min(0.6, 0.8 * rem_now))  # creep in over the last metres (profile hits 0 at B)
+            v_xy = to * vref
+            self.cur_kappa = float(self.k[i])
+            sgn = np.sign(tan[0] * to[1] - tan[1] * to[0]) or 1.0
+            ff_rate = sgn * spd * self.cur_kappa
+            want_yaw = math.atan2(to[1], to[0]) if spd > 0.3 or vref > 0.3 else yaw
+            vz = self._vz(pos[2], self.alt)
+            rem = self.total - self.s[i]
+            if rem < 0.6:
+                v_xy = np.clip(1.0 * (self.c[-1, :2] - pos[:2]), -0.6, 0.6)
+                want_yaw = yaw
+                if spd < 0.4:
+                    self.phase = "descend" if self.land_z is not None else "done"
+        elif self.phase == "descend":
+            v_xy = np.clip(1.0 * (self.c[-1, :2] - pos[:2]), -0.6, 0.6)
+            vz = self._vz(pos[2], self.land_z)
+            if pos[2] - self.land_z < 1.5:
+                vz = max(vz, -0.5)
+            if pos[2] - self.land_z < 0.1 and abs(vel[2]) < 0.2:
+                self.phase = "done"
+        if self.phase == "done":
+            return [0.0, 0.0, 0.0, 0.0], True
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        fwd = v_xy[0] * c + v_xy[1] * s_
+        right = v_xy[0] * s_ - v_xy[1] * c
+        err = (want_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
+        r = float(np.clip(ff_rate + 2.0 * err, -P.yaw_rate_max, P.yaw_rate_max))
         up = vz / P.v_up_max if vz >= 0 else vz / P.v_down_max
         return [float(np.clip(fwd / P.v_h_max, -1, 1)), float(np.clip(right / P.v_h_max, -1, 1)),
                 float(np.clip(up, -1, 1)), float(np.clip(-r / P.yaw_rate_max, -1, 1))], False
