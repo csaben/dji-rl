@@ -143,13 +143,46 @@ class Session:
         self.dyn.pos, self.dyn.vel, self.dyn.yaw, self.dyn.yaw_rate = d.pos.clone(), d.vel.clone(), d.yaw.clone(), d.yaw_rate.clone()
         self.wp = int(self.env.target[0])
 
-    def frame(self, sticks, view: str, pitch_deg: float, noclip: bool = False):
+    def start_replay(self, traj: dict):
+        if traj["scene"] != self.scene.name:
+            from .scene import load_scene
+            self.load_scene(load_scene(REPO / "data" / "splats" / traj["scene"]))
+        self.replay = traj
+        self.replay_t0 = time.time()
+        self.replay_fixed = None
+        self.mode = "replay"
+        self.env = None
+
+    def _replay_pose(self, t_override):
+        tr = self.replay["traj"]
+        dur = tr[-1]["t"]
+        if t_override is not None:
+            self.replay_fixed = t_override
+        t = self.replay_fixed if self.replay_fixed is not None else (time.time() - self.replay_t0) % (dur + 2.0)
+        t = min(max(t, 0.0), dur)
+        i = min(int(t / 0.1), len(tr) - 1)
+        j = min(i + 1, len(tr) - 1)
+        w = (t - tr[i]["t"]) / 0.1 if j > i else 0.0
+        lerp = lambda k: tr[i][k] * (1 - w) + tr[j][k] * w
+        dy = (tr[j]["yaw"] - tr[i]["yaw"] + math.pi) % (2 * math.pi) - math.pi
+        pos = torch.tensor([[lerp("x"), lerp("y"), lerp("z")]], device=self.dev)
+        vel = torch.tensor([[lerp("vx"), lerp("vy"), lerp("vz")]], device=self.dev)
+        yaw = torch.tensor([tr[i]["yaw"] + w * dy], device=self.dev)
+        return pos, vel, yaw, t, dur
+
+    def frame(self, sticks, view: str, pitch_deg: float, noclip: bool = False, cam: str = "fpv", t_override=None):
         with self.lock:
             now = time.time()
             dt = min(now - self.last_t, 0.2)
             self.last_t = now
             self.pitch_deg = pitch_deg
-            if self.mode == "manual":
+            replay_info = None
+            if self.mode == "replay":
+                pos, vel, yaw, t, dur = self._replay_pose(t_override)
+                self.dyn.pos, self.dyn.vel, self.dyn.yaw = pos, vel, yaw
+                replay_info = {"id": self.replay["id"], "t": round(t, 2), "duration": dur,
+                               "paused": self.replay_fixed is not None}
+            elif self.mode == "manual":
                 self.step_manual(sticks, dt, noclip)
                 w = self.scene.waypoints
                 if (w[self.wp] - self.dyn.pos[0]).norm() < 1.5:
@@ -159,7 +192,12 @@ class Session:
             pos, yaw = self.dyn.pos, self.dyn.yaw
             pitch = torch.full_like(yaw, math.radians(pitch_deg))
             r = self.hd if view == "hd" else self.sim
-            img = r.render(pos, yaw, pitch)[0, ..., :3]
+            cam_pos = pos
+            if cam == "chase":  # behind and above, looking at the drone
+                back = torch.stack([torch.cos(yaw), torch.sin(yaw), torch.zeros_like(yaw)], -1)
+                cam_pos = pos - 6.0 * back + torch.tensor([0.0, 0.0, 3.0], device=self.dev)
+                pitch = torch.full_like(yaw, -math.atan2(3.0, 6.0))
+            img = r.render(cam_pos, yaw, pitch)[0, ..., :3]
             if time.time() - self.flash < 0.25:
                 img = img * 0.5 + torch.tensor([0.5, 0, 0], device=self.dev)
             im = Image.fromarray((img.clamp(0, 1).cpu().numpy() * 255).astype("uint8"))
@@ -179,12 +217,15 @@ class Session:
                 "agl": None if agl is None else round(agl, 2), "clearance": round(clearance, 2),
                 "collisions": self.collisions, "mode": self.mode, "waypoint": self.wp,
                 "wp_dist": round((wpt - p).norm().item(), 1), "scene": self.scene.name,
+                "replay": replay_info, "cam": cam,
             }
             return buf.getvalue(), state
 
 
 def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
+    from .sim_api import SimAPI
     sess = Session(scene, device)
+    api = SimAPI(device)
     splats = REPO / "data" / "splats"
 
     class H(BaseHTTPRequestHandler):
@@ -205,9 +246,24 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             if u.path == "/":
                 return self._send(200, PAGE.read_bytes(), "text/html; charset=utf-8")
+            if u.path.startswith("/api/sim/"):
+                return self._api_get(u.path[len("/api/sim/"):], q)
+            if u.path == "/replay":
+                tid = q.get("id", "")
+                if tid not in api.trajs:
+                    return self._send(404, b"unknown trajectory id", "text/plain")
+                with sess.lock:
+                    if q.get("t") is not None and sess.mode == "replay" and sess.replay["id"] == tid:
+                        sess.replay_fixed = None if q["t"] == "play" else float(q["t"])
+                        if q["t"] == "play":
+                            sess.replay_t0 = time.time() - float(q.get("from", 0))
+                    else:
+                        sess.start_replay(api.trajs[tid])
+                return self._send(200, b"ok", "text/plain")
             if u.path == "/frame":
                 sticks = [float(q.get(k, 0)) for k in ("f", "r", "u", "y")]
-                jpg, st = sess.frame(sticks, q.get("view", "hd"), float(q.get("pitch", -10)), q.get("noclip") == "1")
+                jpg, st = sess.frame(sticks, q.get("view", "hd"), float(q.get("pitch", -10)), q.get("noclip") == "1",
+                                     cam=q.get("cam", "fpv"))
                 return self._send(200, jpg, "image/jpeg", {"X-State": json.dumps(st)})
             if u.path == "/info":
                 scenes = sorted(d.name for d in splats.iterdir() if (d / "scene.json").exists())
@@ -234,6 +290,44 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                     sess.set_mode("manual", None)
                 return self._send(200, b"ok", "text/plain")
             return self._send(404, b"not found", "text/plain")
+
+        def _json(self, code, obj):
+            return self._send(code, json.dumps(obj).encode(), "application/json")
+
+        def _api_get(self, what, q):
+            try:
+                if what == "scenes":
+                    return self._json(200, api.list_scenes())
+                name, px = q.get("scene", ""), int(q.get("px", 1024))
+                if what == "topdown":
+                    meta = api.topdown_meta(name, px)
+                    return self._send(200, api.topdown_png(name, px), "image/png",
+                                      {"X-Bounds": json.dumps(meta), "Access-Control-Expose-Headers": "X-Bounds"})
+                if what == "topdown.json":
+                    return self._json(200, api.topdown_meta(name, px))
+                if what == "occupancy":
+                    return self._send(200, api.occupancy_png(name, float(q.get("alt", 5)), float(q.get("clear", 1.5)), px),
+                                      "image/png", {"X-Bounds": json.dumps(api.topdown_meta(name, px))})
+                if what == "traj":
+                    t = api.trajs.get(q.get("id", ""))
+                    return self._json(200 if t else 404, t or {"error": "unknown id"})
+                return self._json(404, {"error": f"unknown endpoint {what}"})
+            except KeyError as e:
+                return self._json(404, {"error": str(e)})
+
+        def do_POST(self):
+            u = urlparse(self.path)
+            if u.path != "/api/sim/fly":
+                return self._json(404, {"error": "not found"})
+            try:
+                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                with sess.lock:  # one GPU, keep fly and frame rendering from interleaving
+                    out = api.fly(req)
+                return self._json(200, out)
+            except KeyError as e:
+                return self._json(400, {"ok": False, "reason": f"missing/unknown field {e}"})
+            except Exception as e:  # noqa: BLE001
+                return self._json(500, {"ok": False, "reason": f"{type(e).__name__}: {e}"})
 
     srv = ThreadingHTTPServer((host, port), H)
     print(f"djirl viewer: http://{host}:{port}  scene={scene.name} device={device}", flush=True)

@@ -1,0 +1,361 @@
+"""Classical (no learning) A->B flight in a scene: plan on the ESDF, track with a pure-pursuit
+controller in the env's virtual-stick action space, simulate with StickDynamics + ESDF contacts.
+
+Endpoints (wired up in viewer.serve):
+  GET  /api/sim/scenes
+  GET  /api/sim/topdown?scene=&px=1024         PNG, north up; sidecar /api/sim/topdown.json?scene=&px=
+  GET  /api/sim/occupancy?scene=&alt=&clear=&px=  PNG mask (255 = blocked: ESDF < clear at alt)
+  POST /api/sim/fly {scene, a:{x,y}, b:{x,y}, alt_m, speed_mps=3, clear_m=1.5, takeoff_land=true, wind=false}
+All coordinates are scene ENU metres (x east, y north, z up, ground ~ z=0).
+"""
+from __future__ import annotations
+
+import heapq
+import io
+import json
+import math
+import time
+import uuid
+from collections import OrderedDict
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image
+
+from .dynamics import StickDynamics, StickParams
+from .scene import Scene, load_scene
+
+REPO = Path(__file__).resolve().parents[2]
+SPLATS = REPO / "data" / "splats"
+DRONE_R = 0.25
+
+
+class SimAPI:
+    def __init__(self, device):
+        self.dev = torch.device(device)
+        self.scenes: dict[str, Scene] = {}
+        self.cache: dict = {}
+        self.trajs: OrderedDict[str, dict] = OrderedDict()
+
+    # ------------------------------------------------------------ scenes
+    def scene(self, name: str) -> Scene:
+        if "/" in name or not (SPLATS / name / "scene.json").exists():
+            raise KeyError(f"no scene {name!r}")
+        if name not in self.scenes:
+            if len(self.scenes) >= 3:  # keep GPU memory bounded
+                self.scenes.pop(next(iter(self.scenes)))
+            self.scenes[name] = load_scene(SPLATS / name).to(self.dev)
+        return self.scenes[name]
+
+    def bounds(self, name: str) -> dict:
+        e = self.scene(name).esdf
+        lo, hi = e.origin.tolist(), e.upper.tolist()
+        return {"x0": round(lo[0], 2), "y0": round(lo[1], 2), "x1": round(hi[0], 2), "y1": round(hi[1], 2),
+                "zmax": round(hi[2], 2)}
+
+    def list_scenes(self) -> list:
+        out = []
+        for d in sorted(p for p in SPLATS.iterdir() if (p / "scene.json").exists()):
+            geo = json.loads((d / "geo.json").read_text()) if (d / "geo.json").exists() else None
+            try:
+                b = self.bounds(d.name) if d.name in self.scenes else self._bounds_from_disk(d)
+            except Exception:  # noqa: BLE001
+                b = None
+            out.append({"name": d.name, "bounds": b, "geo": geo})
+        return out
+
+    @staticmethod
+    def _bounds_from_disk(d: Path) -> dict:
+        z = np.load(d / "esdf.npz")
+        lo = z["origin"]
+        hi = lo + float(z["voxel"]) * (np.array(z["sdf"].shape) - 1)
+        return {"x0": round(float(lo[0]), 2), "y0": round(float(lo[1]), 2), "x1": round(float(hi[0]), 2),
+                "y1": round(float(hi[1]), 2), "zmax": round(float(hi[2]), 2)}
+
+    # ------------------------------------------------------------ maps
+    def _grid(self, name, px):
+        b = self.bounds(name)
+        W = int(px)
+        H = max(1, round(W * (b["y1"] - b["y0"]) / (b["x1"] - b["x0"])))
+        return b, W, H
+
+    def topdown_meta(self, name, px=1024) -> dict:
+        b, W, H = self._grid(name, px)
+        return {"x0": b["x0"], "y0": b["y0"], "x1": b["x1"], "y1": b["y1"], "px_w": W, "px_h": H,
+                "note": "pixel (u,v) centre -> x = x0 + (u+0.5)*(x1-x0)/px_w, y = y1 - (v+0.5)*(y1-y0)/px_h (north up)"}
+
+    @torch.no_grad()
+    def topdown_png(self, name, px=1024) -> bytes:
+        key = ("top", name, px)
+        if key in self.cache:
+            return self.cache[key]
+        from gsplat import rasterization
+        s = self.scene(name)
+        g = s.gaussians
+        b, W, H = self._grid(name, px)
+        # drop sky/cloud gaussians that would cover the map: high ones and very large soft ones
+        keep = (g.means[:, 2] < min(b["zmax"], 12.0)) & (g.scales.max(-1).values < 1.0)
+        m, q, sc, op, sh = (t[keep] for t in (g.means, g.quats, g.scales, g.opacities, g.sh))
+        cx, cy = (b["x0"] + b["x1"]) / 2, (b["y0"] + b["y1"]) / 2
+        R = torch.tensor([[1.0, 0, 0], [0, -1, 0], [0, 0, -1]], device=self.dev)  # right=E, down=S, fwd=-Up
+        p = torch.tensor([cx, cy, 100.0], device=self.dev)
+        V = torch.eye(4, device=self.dev)
+        V[:3, :3], V[:3, 3] = R, -R @ p
+        f = W / (b["x1"] - b["x0"])
+        K = torch.tensor([[f, 0, W / 2], [0, f, H / 2], [0, 0, 1]], device=self.dev)
+        img, alpha, _ = rasterization(m, q, sc, op, sh, V[None], K[None], W, H, sh_degree=g.sh_degree,
+                                      camera_model="ortho", near_plane=0.01, far_plane=1000.0)
+        img = img[0, ..., :3] + (1 - alpha[0]) * torch.tensor([0.15, 0.15, 0.17], device=self.dev)
+        buf = io.BytesIO()
+        Image.fromarray((img.clamp(0, 1).cpu().numpy() * 255).astype("uint8")).save(buf, "PNG")
+        self.cache[key] = buf.getvalue()
+        return self.cache[key]
+
+    def _pixel_xy(self, name, px):
+        b, W, H = self._grid(name, px)
+        xs = b["x0"] + (torch.arange(W, device=self.dev) + 0.5) * (b["x1"] - b["x0"]) / W
+        ys = b["y1"] - (torch.arange(H, device=self.dev) + 0.5) * (b["y1"] - b["y0"]) / H
+        Y, X = torch.meshgrid(ys, xs, indexing="ij")
+        return X, Y
+
+    @torch.no_grad()
+    def occupancy_png(self, name, alt, clear, px=1024) -> bytes:
+        s = self.scene(name)
+        X, Y = self._pixel_xy(name, px)
+        P = torch.stack([X, Y, torch.full_like(X, float(alt))], -1)
+        blocked = s.esdf.query(P.reshape(-1, 3)).reshape(X.shape) < float(clear)
+        buf = io.BytesIO()
+        Image.fromarray(blocked.cpu().numpy().astype("uint8") * 255).save(buf, "PNG")
+        return buf.getvalue()
+
+    # ------------------------------------------------------------ planning
+    @torch.no_grad()
+    def _ground_z(self, s, x, y, top):
+        zs = torch.arange(top, -3.0, -0.1, device=self.dev)
+        sd = s.esdf.query(torch.stack([torch.full_like(zs, x), torch.full_like(zs, y), zs], -1))
+        hit = (sd < 0.05).nonzero()
+        return float(zs[hit[0, 0]]) if len(hit) else 0.0
+
+    @torch.no_grad()
+    def plan(self, s, a, b, alt, clear, res=0.5):
+        e = s.esdf
+        lo, hi = e.origin.tolist(), e.upper.tolist()
+        xs = np.arange(lo[0] + res / 2, hi[0], res)
+        ys = np.arange(lo[1] + res / 2, hi[1], res)
+        X, Y = np.meshgrid(xs, ys, indexing="ij")
+        P = torch.tensor(np.stack([X, Y, np.full_like(X, alt)], -1).reshape(-1, 3), dtype=torch.float32, device=self.dev)
+        free = (e.query(P).reshape(X.shape) >= clear).cpu().numpy()
+        nx, ny = free.shape
+        cell = lambda p: (int(round((p[0] - xs[0]) / res)), int(round((p[1] - ys[0]) / res)))
+        sa, sb = cell(a), cell(b)
+        for nm, c in (("A", sa), ("B", sb)):
+            if not (0 <= c[0] < nx and 0 <= c[1] < ny):
+                return None, f"{nm} is outside the scene bounds"
+            if not free[c]:
+                return None, f"{nm} is blocked at {alt} m with {clear} m clearance"
+        # A* (8-connected)
+        nbr = [(1, 0, 1), (-1, 0, 1), (0, 1, 1), (0, -1, 1), (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414)]
+        h = lambda c: math.hypot(c[0] - sb[0], c[1] - sb[1])
+        openq = [(h(sa), 0.0, sa)]
+        g = {sa: 0.0}
+        parent = {}
+        closed = set()
+        while openq:
+            _, gc, c = heapq.heappop(openq)
+            if c == sb:
+                break
+            if c in closed:
+                continue
+            closed.add(c)
+            for dx, dy, w in nbr:
+                n = (c[0] + dx, c[1] + dy)
+                if not (0 <= n[0] < nx and 0 <= n[1] < ny) or not free[n]:
+                    continue
+                ng = gc + w
+                if ng < g.get(n, 1e18):
+                    g[n], parent[n] = ng, c
+                    heapq.heappush(openq, (ng + h(n), ng, n))
+        if sb not in parent and sa != sb:
+            return None, f"no path at {alt} m with {clear} m clearance"
+        cells = [sb]
+        while cells[-1] != sa:
+            cells.append(parent[cells[-1]])
+        cells.reverse()
+        pts = [np.array([xs[c[0]], ys[c[1]], alt]) for c in cells]
+        pts[0], pts[-1] = np.array([a[0], a[1], alt]), np.array([b[0], b[1], alt])
+        # shortcut smoothing: keep the farthest visible point (ESDF line-of-sight with clearance)
+        def visible(p, q):
+            n = max(2, int(np.linalg.norm(q - p) / 0.2))
+            seg = torch.tensor(np.linspace(p, q, n), dtype=torch.float32, device=self.dev)
+            return bool((e.query(seg) >= clear * 0.9).all())
+        out, i = [pts[0]], 0
+        while i < len(pts) - 1:
+            j = len(pts) - 1
+            while j > i + 1 and not visible(pts[i], pts[j]):
+                j -= 1
+            out.append(pts[j])
+            i = j
+        return np.array(out), None
+
+    # ------------------------------------------------------------ fly
+    @torch.no_grad()
+    def fly(self, req: dict) -> dict:
+        name = req["scene"]
+        s = self.scene(name)
+        a = (float(req["a"]["x"]), float(req["a"]["y"]))
+        b = (float(req["b"]["x"]), float(req["b"]["y"]))
+        alt = float(req.get("alt_m", 5.0))
+        speed = float(req.get("speed_mps", 3.0))
+        clear = float(req.get("clear_m", 1.5))
+        tol = bool(req.get("takeoff_land", True))
+        wind = bool(req.get("wind", False))
+        path, why = self.plan(s, a, b, alt, clear)
+        if path is None:
+            return {"ok": False, "reason": why}
+        gA = self._ground_z(s, a[0], a[1], alt)
+        gB = self._ground_z(s, b[0], b[1], alt)
+        # columns at A and B must be clear for the climb/descent
+        for nm, (x, y), gz in (("A", a, gA), ("B", b, gB)):
+            zs = torch.arange(gz + 0.6, alt, 0.2, device=self.dev)
+            if tol and len(zs) and bool((s.esdf.query(torch.stack([torch.full_like(zs, x), torch.full_like(zs, y), zs], -1)) < DRONE_R + 0.1).any()):
+                return {"ok": False, "reason": f"vertical column above {nm} is blocked (overhang between ground and {alt} m)"}
+        P = StickParams(dr=0.0, wind_std=0.3 if wind else 0.0)
+        dyn = StickDynamics(1, P, self.dev, control_dt=0.1, substeps=5)
+        start = torch.tensor([[a[0], a[1], (gA + 0.35) if tol else alt]], device=self.dev)
+        d0 = path[1] - path[0] if len(path) > 1 else np.array([1.0, 0, 0])
+        dyn.reset(torch.tensor([0], device=self.dev), start, torch.tensor([math.atan2(d0[1], d0[0])], device=self.dev))
+        ctl = PursuitController(path, alt, speed, P, gB + 0.35 if tol else None, (a[0], a[1]))
+        traj, collisions, contact, min_clear, touchdown = [], 0, False, 1e9, False
+        t_max = sum(np.linalg.norm(np.diff(path, axis=0), axis=1)) / max(speed, 0.5) * 3 + 60
+        t = 0.0
+        reached = False
+        while t < t_max:
+            pos = dyn.pos[0].cpu().numpy()
+            vel = dyn.vel[0].cpu().numpy()
+            yaw = float(dyn.yaw[0])
+            cmd, done = ctl.command(pos, vel, yaw)
+            clear_now = float(s.esdf.query(dyn.pos)[0])
+            traj.append({"t": round(t, 2), "x": round(float(pos[0]), 3), "y": round(float(pos[1]), 3), "z": round(float(pos[2]), 3),
+                         "vx": round(float(vel[0]), 3), "vy": round(float(vel[1]), 3), "vz": round(float(vel[2]), 3),
+                         "yaw": round(yaw, 4), "cmd": [round(float(c), 3) for c in cmd], "clear": round(clear_now, 3)})
+            if done:
+                reached = True
+                break
+            subs = dyn.step(torch.tensor([cmd], dtype=torch.float32, device=self.dev))
+            sd = s.esdf.query(torch.cat(subs))
+            if ctl.phase == "cruise":  # clearance stat = en-route only (takeoff/landing touch the ground)
+                min_clear = min(min_clear, float(sd.min()))
+            hit = bool(sd.min() < DRONE_R)
+            landing = tol and ctl.phase in ("descend", "done") and float(dyn.pos[0, 2]) - gB < 0.8
+            if hit and landing:
+                touchdown = True
+            elif hit and not contact:
+                collisions += 1
+            contact = hit and not landing
+            t += 0.1
+        final = np.array([traj[-1]["x"], traj[-1]["y"]])
+        tid = uuid.uuid4().hex[:10]
+        length = float(sum(math.dist((p["x"], p["y"], p["z"]), (q["x"], q["y"], q["z"])) for p, q in zip(traj, traj[1:])))
+        out = {"ok": True, "id": tid, "scene": name, "path": [[round(float(v), 3) for v in p] for p in path], "traj": traj,
+               "length_m": round(length, 2), "duration_s": round(t, 2), "min_clear_m": round(min_clear, 3),
+               "collisions": collisions, "touchdown": touchdown, "reached": reached, "final_err_m": round(float(np.linalg.norm(final - np.array(b))), 3)}
+        self.trajs[tid] = out
+        while len(self.trajs) > 20:
+            self.trajs.popitem(last=False)
+        return out
+
+
+class PursuitController:
+    """Phases: climb at A -> pure pursuit along the path at alt -> descend at B. Outputs the env's
+    action [fwd, right, up, yaw_right] in [-1,1]. Speed profile respects a braking budget for the
+    endpoint and for corners (using a derated a_brake to cover lag and command delay)."""
+
+    def __init__(self, path, alt, speed, P: StickParams, land_z, a_xy):
+        self.path, self.alt, self.speed, self.P = path, alt, speed, P
+        self.land_z, self.a_xy = land_z, np.array(a_xy)
+        self.phase = "climb"
+        self.seg = 0
+        self.a_b = 0.6 * P.a_brake
+        seglen = np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)
+        self.cum = np.concatenate([[0], np.cumsum(seglen)])
+        self.total = self.cum[-1]
+        # corner speed limits at interior vertices
+        self.v_corner = np.full(len(path), speed)
+        for i in range(1, len(path) - 1):
+            u, w = path[i, :2] - path[i - 1, :2], path[i + 1, :2] - path[i, :2]
+            cth = float(u @ w / (np.linalg.norm(u) * np.linalg.norm(w) + 1e-9))
+            th = math.acos(max(-1, min(1, cth)))
+            self.v_corner[i] = max(0.8, speed * (1 - th / math.pi) ** 2)
+        self.v_corner[-1] = 0.0
+
+    def _project(self, p):
+        best, bs, bt = 1e9, self.seg, 0.0
+        for i in range(self.seg, min(self.seg + 3, len(self.path) - 1)):
+            a, b = self.path[i, :2], self.path[i + 1, :2]
+            ab = b - a
+            t = float(np.clip((p - a) @ ab / (ab @ ab + 1e-9), 0, 1))
+            d = float(np.linalg.norm(a + t * ab - p))
+            if d < best:
+                best, bs, bt = d, i, t
+        self.seg = bs
+        return self.cum[bs] + bt * (self.cum[bs + 1] - self.cum[bs])
+
+    def _at(self, s):
+        s = min(max(s, 0), self.total)
+        i = int(np.searchsorted(self.cum, s, side="right") - 1)
+        i = min(i, len(self.path) - 2)
+        t = (s - self.cum[i]) / max(self.cum[i + 1] - self.cum[i], 1e-9)
+        return self.path[i, :2] + t * (self.path[i + 1, :2] - self.path[i, :2])
+
+    def _vz(self, z, target):
+        return float(np.clip(1.2 * (target - z), -self.P.v_down_max * 0.8, self.P.v_up_max * 0.8))
+
+    def command(self, pos, vel, yaw):
+        P = self.P
+        v_xy = np.zeros(2)
+        vz = 0.0
+        want_yaw = yaw
+        if self.phase == "climb":
+            v_xy = np.clip(1.0 * (self.a_xy - pos[:2]), -1, 1)
+            vz = self._vz(pos[2], self.alt)
+            if abs(pos[2] - self.alt) < 0.3:
+                self.phase = "cruise"
+        elif self.phase == "cruise":
+            s = self._project(pos[:2])
+            rem = self.total - s
+            spd = float(np.linalg.norm(vel[:2]))
+            look = 1.5 + 0.6 * spd
+            target = self._at(s + look)
+            d = target - pos[:2]
+            dn = d / (np.linalg.norm(d) + 1e-9)
+            v = min(self.speed, math.sqrt(max(0.0, 2 * self.a_b * max(rem - 0.3, 0))) + 0.2)
+            for i in range(self.seg + 1, len(self.path)):
+                dist = self.cum[i] - s
+                if dist > 25:
+                    break
+                v = min(v, math.sqrt(self.v_corner[i] ** 2 + 2 * self.a_b * max(dist, 0)))
+            v_xy = dn * v
+            if rem < 0.6:
+                v_xy = np.clip(1.0 * (self.path[-1, :2] - pos[:2]), -0.6, 0.6)
+            want_yaw = math.atan2(dn[1], dn[0]) if np.linalg.norm(d) > 0.5 else yaw
+            vz = self._vz(pos[2], self.alt)
+            if rem < 0.5 and spd < 0.4:
+                self.phase = "descend" if self.land_z is not None else "done"
+        elif self.phase == "descend":
+            v_xy = np.clip(1.0 * (self.path[-1, :2] - pos[:2]), -0.6, 0.6)
+            vz = self._vz(pos[2], self.land_z)
+            if pos[2] - self.land_z < 1.5:  # gentle final approach
+                vz = max(vz, -0.5)
+            if pos[2] - self.land_z < 0.1 and abs(vel[2]) < 0.2:
+                self.phase = "done"
+        if self.phase == "done":
+            return [0.0, 0.0, 0.0, 0.0], True
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        fwd = v_xy[0] * c + v_xy[1] * s_
+        right = v_xy[0] * s_ - v_xy[1] * c
+        err = (want_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
+        r = float(np.clip(2.0 * err, -P.yaw_rate_max, P.yaw_rate_max))
+        up = vz / P.v_up_max if vz >= 0 else vz / P.v_down_max
+        return [float(np.clip(fwd / P.v_h_max, -1, 1)), float(np.clip(right / P.v_h_max, -1, 1)),
+                float(np.clip(up, -1, 1)), float(np.clip(-r / P.yaw_rate_max, -1, 1))], False

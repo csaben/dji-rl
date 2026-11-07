@@ -50,6 +50,14 @@
     <h1>dji-rl flight viewer</h1>
     <div class="note">The sim's own camera, stick dynamics and collision grid. What you see in <b>Policy input</b> view is exactly what the policy gets (before the encoder).</div>
 
+    <div id="replayBox" hidden>
+      <h2>Replay</h2>
+      <div class="row seg" id="camSeg"><button data-c="chase" class="on">Chase</button><button data-c="fpv">FPV</button></div>
+      <div class="row" style="margin-top:8px"><button id="playBtn">Pause</button></div>
+      <label>Time <span id="tV">0.0 s</span></label>
+      <input type="range" id="tSlider" min="0" max="100" step="0.1" value="0">
+    </div>
+
     <h2>Camera</h2>
     <div class="row seg" id="viewSeg"><button data-v="hd" class="on">HD 960×540</button><button data-v="sim">Policy input 128×96</button></div>
     <label>Gimbal pitch <span id="pitchV">-10°</span></label>
@@ -87,6 +95,8 @@ const $ = (id) => document.getElementById(id);
 const view = $("view"), ctx = view.getContext("2d");
 let viewMode = "hd", pitch = -10, scale = 0.6, info = null, state = null;
 let noclip = new URLSearchParams(location.search).get("explore") === "1";
+const replayId = new URLSearchParams(location.search).get("replay");
+let cam = replayId ? "chase" : "fpv", paused = false, scrubbing = false;
 const keys = new Set();
 const stick = { f: 0, r: 0, u: 0, y: 0 };
 
@@ -94,7 +104,7 @@ addEventListener("keydown", (e) => {
   if (e.target.tagName === "SELECT") return;
   keys.add(e.code);
   if (e.code === "KeyV") setView(viewMode === "hd" ? "sim" : "hd");
-  if (e.code === "KeyR") fetch("/reset");
+  if (e.code === "KeyR") fetch("reset");
   if (e.code === "KeyN") { noclip = !noclip; $("noclip").checked = noclip; }
   if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
 });
@@ -127,22 +137,22 @@ function setView(v) {
 $("viewSeg").onclick = (e) => e.target.dataset.v && setView(e.target.dataset.v);
 $("pitch").oninput = (e) => { pitch = +e.target.value; $("pitchV").textContent = pitch + "°"; };
 $("scale").oninput = (e) => { scale = e.target.value / 100; $("scaleV").textContent = e.target.value + "%"; };
-$("reset").onclick = () => fetch("/reset");
+$("reset").onclick = () => fetch("reset");
 $("noclip").checked = noclip;
 $("noclip").onchange = (e) => { noclip = e.target.checked; };
 $("modeSeg").onclick = async (e) => {
   const m = e.target.dataset.m; if (!m) return;
   if (m === "policy" && !$("ckpt").value) { banner("no checkpoint yet: train one first", 2500); return; }
-  await fetch(`/mode?mode=${m}&ckpt=${encodeURIComponent($("ckpt").value)}`);
+  await fetch(`mode?mode=${m}&ckpt=${encodeURIComponent($("ckpt").value)}`);
   for (const b of $("modeSeg").children) b.classList.toggle("on", b.dataset.m === m);
 };
-$("scene").onchange = async (e) => { await fetch(`/scene?name=${encodeURIComponent(e.target.value)}`); await loadInfo(); };
+$("scene").onchange = async (e) => { await fetch(`scene?name=${encodeURIComponent(e.target.value)}`); await loadInfo(); };
 
 let bannerT = 0;
 function banner(text, ms) { const b = $("banner"); b.textContent = text; b.hidden = false; bannerT = performance.now() + ms; }
 
 async function loadInfo() {
-  info = await (await fetch("/info")).json();
+  info = await (await fetch("info")).json();
   $("scene").innerHTML = info.scenes.map((s) => `<option ${s === info.scene ? "selected" : ""}>${s}</option>`).join("");
   $("ckpt").innerHTML = info.policies.length ? info.policies.map((p) => `<option>${p}</option>`).join("") : `<option value="">(none yet)</option>`;
   for (const b of $("modeSeg").children) b.classList.toggle("on", b.dataset.m === info.mode);
@@ -191,19 +201,37 @@ async function loop() {
     fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
     readSticks(dt);
     try {
-      const q = `f=${stick.f.toFixed(3)}&r=${stick.r.toFixed(3)}&u=${stick.u.toFixed(3)}&y=${stick.y.toFixed(3)}&view=${viewMode}&pitch=${pitch}&noclip=${noclip ? 1 : 0}`;
-      const res = await fetch(`/frame?${q}`);
+      const q = `f=${stick.f.toFixed(3)}&r=${stick.r.toFixed(3)}&u=${stick.u.toFixed(3)}&y=${stick.y.toFixed(3)}&view=${viewMode}&pitch=${pitch}&noclip=${noclip ? 1 : 0}&cam=${cam}`;
+      const res = await fetch(`frame?${q}`);
       state = JSON.parse(res.headers.get("X-State"));
       const bmp = await createImageBitmap(await res.blob());
       if (view.width !== bmp.width) { view.width = bmp.width; view.height = bmp.height; }
       ctx.drawImage(bmp, 0, 0);
       drawHud(state, fps); drawMap(state);
+      if (state.replay && !scrubbing) {
+        $("tSlider").max = state.replay.duration; $("tSlider").value = state.replay.t;
+        $("tV").textContent = `${state.replay.t.toFixed(1)} / ${state.replay.duration.toFixed(1)} s`;
+      }
       if (state.collisions > lastCol) banner("COLLISION", 700); lastCol = state.collisions;
       if (performance.now() > bannerT) $("banner").hidden = true;
     } catch (err) { banner("server unreachable, retrying…", 1500); await new Promise((r) => setTimeout(r, 1000)); }
   }
 }
-loadInfo().then(() => { view.focus(); loop(); });
+if (replayId) {
+  $("replayBox").hidden = false;
+  $("camSeg").onclick = (e) => { if (!e.target.dataset.c) return; cam = e.target.dataset.c;
+    for (const b of $("camSeg").children) b.classList.toggle("on", b.dataset.c === cam); };
+  $("playBtn").onclick = async () => {
+    paused = !paused; $("playBtn").textContent = paused ? "Play" : "Pause";
+    const t = +$("tSlider").value;
+    await fetch(paused ? `replay?id=${replayId}&t=${t}` : `replay?id=${replayId}&t=play&from=${t}`);
+  };
+  $("tSlider").oninput = (e) => { scrubbing = true; paused = true; $("playBtn").textContent = "Play";
+    fetch(`replay?id=${replayId}&t=${e.target.value}`); };
+  $("tSlider").onchange = () => { scrubbing = false; };
+}
+(replayId ? fetch(`replay?id=${replayId}`) : Promise.resolve())
+  .then(loadInfo).then(() => { view.focus(); loop(); });
 </script>
 </body>
 </html>
