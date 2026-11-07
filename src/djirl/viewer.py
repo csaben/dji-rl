@@ -168,6 +168,9 @@ class Session:
         pos = torch.tensor([[lerp("x"), lerp("y"), lerp("z")]], device=self.dev)
         vel = torch.tensor([[lerp("vx"), lerp("vy"), lerp("vz")]], device=self.dev)
         yaw = torch.tensor([tr[i]["yaw"] + w * dy], device=self.dev)
+        gp = tr[i].get("gimbal_pitch_deg")
+        self.replay_gimbal = None if gp is None else gp * (1 - w) + tr[j].get("gimbal_pitch_deg", gp) * w
+        self.replay_poi = tr[i].get("poi", -1)
         return pos, vel, yaw, t, dur
 
     def frame(self, sticks, view: str, pitch_deg: float, noclip: bool = False, cam: str = "fpv", t_override=None):
@@ -181,7 +184,10 @@ class Session:
                 pos, vel, yaw, t, dur = self._replay_pose(t_override)
                 self.dyn.pos, self.dyn.vel, self.dyn.yaw = pos, vel, yaw
                 replay_info = {"id": self.replay["id"], "t": round(t, 2), "duration": dur,
-                               "paused": self.replay_fixed is not None}
+                               "paused": self.replay_fixed is not None, "poi": self.replay_poi,
+                               "gimbal_pitch_deg": self.replay_gimbal}
+                if self.replay_gimbal is not None:
+                    pitch_deg = self.replay_gimbal
             elif self.mode == "manual":
                 self.step_manual(sticks, dt, noclip)
                 w = self.scene.waypoints

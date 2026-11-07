@@ -317,7 +317,18 @@ class SimAPI:
         start = torch.tensor([[a[0], a[1], (gA + 0.35) if tol else alt]], device=self.dev)
         d0 = path[1] - path[0] if len(path) > 1 else np.array([1.0, 0, 0])
         dyn.reset(torch.tensor([0], device=self.dev), start, torch.tensor([math.atan2(d0[1], d0[0])], device=self.dev))
-        ctl = PursuitController(path, alt, speed, P, gB + 0.35 if tol else None, (a[0], a[1]))
+        pois = []
+        for i, pi in enumerate(req.get("pois") or []):
+            px_, py_ = float(pi["x"]), float(pi["y"])
+            pz = pi.get("z")
+            if pz is None:  # terrain height + 1 m
+                pz = float(self._terrain_at(s, torch.tensor([px_], device=self.dev), torch.tensor([py_], device=self.dev))[0]) + 1.0
+            pois.append({"x": px_, "y": py_, "z": round(float(pz), 3), "label": pi.get("label", f"poi{i}")})
+        poi_mode = req.get("poi_mode", "nearest")
+        if poi_mode not in ("nearest", "sequence"):
+            return {"ok": False, "reason": f"poi_mode must be 'nearest' or 'sequence', got {poi_mode!r}"}
+        ctl = PursuitController(path, alt, speed, P, gB + 0.35 if tol else None, (a[0], a[1]),
+                                pois=pois, poi_mode=poi_mode)
         traj, collisions, contact, min_clear, touchdown = [], 0, False, 1e9, False
         t_max = sum(np.linalg.norm(np.diff(path, axis=0), axis=1)) / max(speed, 0.5) * 3 + 60
         t = 0.0
@@ -330,7 +341,8 @@ class SimAPI:
             clear_now = float(self.q(s, dyn.pos)[0])
             traj.append({"t": round(t, 2), "x": round(float(pos[0]), 3), "y": round(float(pos[1]), 3), "z": round(float(pos[2]), 3),
                          "vx": round(float(vel[0]), 3), "vy": round(float(vel[1]), 3), "vz": round(float(vel[2]), 3),
-                         "yaw": round(yaw, 4), "cmd": [round(float(c), 3) for c in cmd], "clear": round(clear_now, 3)})
+                         "yaw": round(yaw, 4), "cmd": [round(float(c), 3) for c in cmd], "clear": round(clear_now, 3),
+                         "gimbal_pitch_deg": round(ctl.gimbal_deg, 2), "poi": ctl.active})
             if done:
                 reached = True
                 break
@@ -350,6 +362,7 @@ class SimAPI:
         tid = uuid.uuid4().hex[:10]
         length = float(sum(math.dist((p["x"], p["y"], p["z"]), (q["x"], q["y"], q["z"])) for p, q in zip(traj, traj[1:])))
         out = {"ok": True, "id": tid, "scene": name, "path": [[round(float(v), 3) for v in p] for p in path], "traj": traj,
+               "pois": pois, "poi_mode": poi_mode,
                "length_m": round(length, 2), "duration_s": round(t, 2), "min_clear_m": round(min_clear, 3),
                "collisions": collisions, "touchdown": touchdown, "reached": reached, "final_err_m": round(float(np.linalg.norm(final - np.array(b))), 3)}
         self.trajs[tid] = out
@@ -363,8 +376,16 @@ class PursuitController:
     action [fwd, right, up, yaw_right] in [-1,1]. Speed profile respects a braking budget for the
     endpoint and for corners (using a derated a_brake to cover lag and command delay)."""
 
-    def __init__(self, path, alt, speed, P: StickParams, land_z, a_xy):
+    GIMBAL_MIN, GIMBAL_MAX, GIMBAL_RATE = -90.0, 20.0, 60.0  # Mini 3 gimbal pitch range (deg), rate (deg/s)
+    NEAREST_HYST = 2.0  # m
+
+    def __init__(self, path, alt, speed, P: StickParams, land_z, a_xy, pois=None, poi_mode="nearest", dt=0.1,
+                 default_gimbal=-10.0):
         self.path, self.alt, self.speed, self.P = path, alt, speed, P
+        self.pois = pois or []
+        self.poi_mode, self.dt = poi_mode, dt
+        self.active = 0 if self.pois else -1
+        self.gimbal_deg = default_gimbal
         self.land_z, self.a_xy = land_z, np.array(a_xy)
         self.phase = "climb"
         self.seg = 0
@@ -380,6 +401,43 @@ class PursuitController:
             th = math.acos(max(-1, min(1, cth)))
             self.v_corner[i] = max(0.8, speed * (1 - th / math.pi) ** 2)
         self.v_corner[-1] = 0.0
+        # sequence mode: arc length of each POI's projection onto the path
+        self.poi_s = []
+        for q in self.pois:
+            best, bs = 1e18, 0.0
+            for i in range(len(path) - 1):
+                a, b = path[i, :2], path[i + 1, :2]
+                ab = b - a
+                t = float(np.clip((np.array([q["x"], q["y"]]) - a) @ ab / (ab @ ab + 1e-9), 0, 1))
+                d = float(np.linalg.norm(a + t * ab - np.array([q["x"], q["y"]])))
+                if d < best:
+                    best, bs = d, self.cum[i] + t * (self.cum[i + 1] - self.cum[i])
+            self.poi_s.append(bs)
+
+    def _update_poi(self, pos, s_path):
+        if not self.pois:
+            return
+        if self.phase == "climb":
+            self.active = 0 if self.poi_mode == "sequence" else self.active
+        if self.poi_mode == "sequence":
+            while self.active + 1 < len(self.pois) and s_path is not None and s_path >= self.poi_s[self.active + 1]:
+                self.active += 1
+            if self.phase in ("descend", "done"):
+                self.active = len(self.pois) - 1
+        else:
+            d = [math.hypot(q["x"] - pos[0], q["y"] - pos[1]) for q in self.pois]
+            k = int(np.argmin(d))
+            if self.active < 0 or d[k] < d[self.active] - self.NEAREST_HYST:
+                self.active = k
+
+    def _poi_aim(self, pos, yaw):
+        """yaw target (rad) and gimbal pitch target (deg) for the active POI."""
+        q = self.pois[self.active]
+        dx, dy, dz = q["x"] - pos[0], q["y"] - pos[1], q["z"] - pos[2]
+        h = math.hypot(dx, dy)
+        want_yaw = math.atan2(dy, dx) if h > 0.3 else yaw
+        pitch = math.degrees(math.atan2(dz, max(h, 1e-3)))
+        return want_yaw, float(np.clip(pitch, self.GIMBAL_MIN, self.GIMBAL_MAX))
 
     def _project(self, p):
         best, bs, bt = 1e9, self.seg, 0.0
@@ -404,10 +462,16 @@ class PursuitController:
         return float(np.clip(1.2 * (target - z), -self.P.v_down_max * 0.8, self.P.v_up_max * 0.8))
 
     def command(self, pos, vel, yaw):
+        cmd, done = self._command(pos, vel, yaw)
+        return cmd, done
+
+    def _command(self, pos, vel, yaw):
         P = self.P
         v_xy = np.zeros(2)
         vz = 0.0
         want_yaw = yaw
+        s_now = self._project(pos[:2]) if self.phase != "climb" else 0.0
+        self._update_poi(pos, s_now)
         if self.phase == "climb":
             v_xy = np.clip(1.0 * (self.a_xy - pos[:2]), -1, 1)
             vz = self._vz(pos[2], self.alt)
@@ -443,6 +507,10 @@ class PursuitController:
                 self.phase = "done"
         if self.phase == "done":
             return [0.0, 0.0, 0.0, 0.0], True
+        if self.pois:  # look-at: yaw + gimbal track the active POI; translation keeps following the path
+            want_yaw, g_target = self._poi_aim(pos, yaw)
+            step = self.GIMBAL_RATE * self.dt
+            self.gimbal_deg = float(np.clip(g_target, self.gimbal_deg - step, self.gimbal_deg + step))
         c, s_ = math.cos(yaw), math.sin(yaw)
         fwd = v_xy[0] * c + v_xy[1] * s_
         right = v_xy[0] * s_ - v_xy[1] * c
