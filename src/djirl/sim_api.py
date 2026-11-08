@@ -446,7 +446,9 @@ class SimAPI:
             pz = pi.get("z")
             if pz is None:  # terrain height + 1 m
                 pz = float(self._terrain_at(s, torch.tensor([px_], device=self.dev), torch.tensor([py_], device=self.dev))[0]) + 1.0
-            pois.append({"x": px_, "y": py_, "z": round(float(pz), 3), "label": pi.get("label", f"poi{i}")})
+            rad = pi.get("radius_m")
+            rad = None if rad in (None, "") else float(rad)
+            pois.append({"x": px_, "y": py_, "z": round(float(pz), 3), "label": pi.get("label", f"poi{i}"), "radius_m": rad})
         if style == "fpv":
             pois = []
         P = StickParams(dr=0.0, wind_std=0.3 if wind else 0.0)
@@ -601,6 +603,7 @@ class PursuitController:
         self.poi_mode, self.dt = poi_mode, dt
         self.active = 0 if self.pois else -1
         self.gimbal_deg = default_gimbal
+        self.default_gimbal = default_gimbal
         self.land_z, self.a_xy = land_z, np.array(a_xy)
         self.phase = "climb"
         self.seg = 0
@@ -640,9 +643,15 @@ class PursuitController:
             if self.phase in ("descend", "done"):
                 self.active = len(self.pois) - 1
         else:
+            # optional per-POI activation radius (horizontal); the active one releases at radius + hysteresis
             d = [math.hypot(q["x"] - pos[0], q["y"] - pos[1]) for q in self.pois]
-            k = int(np.argmin(d))
-            if self.active < 0 or d[k] < d[self.active] - self.NEAREST_HYST:
+            ok = [q.get("radius_m") is None or d[i] <= q["radius_m"] + (self.NEAREST_HYST if i == self.active else 0.0)
+                  for i, q in enumerate(self.pois)]
+            if not any(ok):
+                self.active = -1
+                return
+            k = min((i for i in range(len(d)) if ok[i]), key=lambda i: d[i])
+            if self.active < 0 or not ok[self.active] or d[k] < d[self.active] - self.NEAREST_HYST:
                 self.active = k
 
     def _poi_aim(self, pos, yaw):
@@ -655,8 +664,13 @@ class PursuitController:
         return want_yaw, float(np.clip(pitch, self.GIMBAL_MIN, self.GIMBAL_MAX))
 
     def _project(self, p):
+        # only segments starting within a few metres ahead of the current progress: on a loop (B == A)
+        # the last segment also passes through A, and snapping to it would end the flight at takeoff
+        s_last = getattr(self, "_s_last", 0.0)
         best, bs, bt = 1e9, self.seg, 0.0
         for i in range(self.seg, min(self.seg + 3, len(self.path) - 1)):
+            if i > self.seg and self.cum[i] > s_last + 3.0:
+                break
             a, b = self.path[i, :2], self.path[i + 1, :2]
             ab = b - a
             t = float(np.clip((p - a) @ ab / (ab @ ab + 1e-9), 0, 1))
@@ -664,7 +678,8 @@ class PursuitController:
             if d < best:
                 best, bs, bt = d, i, t
         self.seg = bs
-        return self.cum[bs] + bt * (self.cum[bs + 1] - self.cum[bs])
+        self._s_last = self.cum[bs] + bt * (self.cum[bs + 1] - self.cum[bs])
+        return self._s_last
 
     def _at(self, s):
         s = min(max(s, 0), self.total)
@@ -722,15 +737,18 @@ class PursuitController:
                 self.phase = "done"
         if self.phase == "done":
             return [0.0, 0.0, 0.0, 0.0], True
+        yaw_max = P.yaw_rate_max
         if self.pois:  # look-at: yaw + gimbal track the active POI; translation keeps following the path
-            want_yaw, g_target = self._poi_aim(pos, yaw)
+            # no POI in range: yaw follows travel (want_yaw above), gimbal eases back to the default
+            want_yaw, g_target = self._poi_aim(pos, yaw) if self.active >= 0 else (want_yaw, self.default_gimbal)
             step = self.GIMBAL_RATE * self.dt
             self.gimbal_deg = float(np.clip(g_target, self.gimbal_deg - step, self.gimbal_deg + step))
+            yaw_max = min(yaw_max, math.radians(self.GIMBAL_RATE))   # smooth look-at hand-offs (phone caps 60 deg/s too)
         c, s_ = math.cos(yaw), math.sin(yaw)
         fwd = v_xy[0] * c + v_xy[1] * s_
         right = v_xy[0] * s_ - v_xy[1] * c
         err = (want_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
-        r = float(np.clip(2.0 * err, -P.yaw_rate_max, P.yaw_rate_max))
+        r = float(np.clip(2.0 * err, -yaw_max, yaw_max))
         up = vz / P.v_up_max if vz >= 0 else vz / P.v_down_max
         return [float(np.clip(fwd / P.v_h_max, -1, 1)), float(np.clip(right / P.v_h_max, -1, 1)),
                 float(np.clip(up, -1, 1)), float(np.clip(-r / P.yaw_rate_max, -1, 1))], False
