@@ -16,6 +16,8 @@ Unauthenticated: 401 (HTML login form for browser navigations). Repeated failure
 
 Routes:
   /pilot          WebSocket -> ws://100.80.98.4:8971/ (the pilot link, docs/pilot-protocol.md)
+  /upload         -> http://100.80.98.4:8966/upload (dji-upload; use &offset=&total= parts, Cloudflare caps
+                     request bodies at 100 MB)
   /healthz        no auth, "ok"
   everything else -> http://127.0.0.1:8968 (planner: app pages, /sim/* sim viewer + splat jobs, missions,
                      videos), HTTP and WebSocket, streamed both ways
@@ -70,8 +72,8 @@ def guest_denied(method: str, path: str, body: bytes) -> str | None:
 
 
 class Gate:
-    def __init__(self, keys: dict[str, str], planner: str, pilot: str):
-        self.keys, self.planner, self.pilot = keys, planner.rstrip("/"), pilot
+    def __init__(self, keys: dict[str, str], planner: str, pilot: str, upload: str):
+        self.keys, self.planner, self.pilot, self.upload = keys, planner.rstrip("/"), pilot, upload.rstrip("/")
         self.fails: dict[str, deque] = defaultdict(deque)
         self.http: aiohttp.ClientSession | None = None
 
@@ -153,6 +155,8 @@ class Gate:
                 return web.json_response({"error": why, "ok": False}, status=403)
         if r.path == "/pilot":
             return await self.ws(r, self.pilot + qs)
+        if r.path == "/upload":
+            return await self.forward(r, self.upload + r.path + qs, body)
         if r.headers.get("Upgrade", "").lower() == "websocket":
             return await self.ws(r, self.planner.replace("http", "ws", 1) + r.path + qs)
         return await self.forward(r, self.planner + r.path + qs, body)
@@ -203,7 +207,7 @@ class Gate:
 
 
 async def main_async(a):
-    g = Gate({load_token(TOKEN_FILE): "owner", load_token(GUEST_FILE): "guest"}, a.planner, a.pilot)
+    g = Gate({load_token(TOKEN_FILE): "owner", load_token(GUEST_FILE): "guest"}, a.planner, a.pilot, a.upload)
     g.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=600),
                                    auto_decompress=False)
     app = web.Application(client_max_size=4 * 1024 ** 3)
@@ -221,6 +225,7 @@ def main():
     ap.add_argument("--port", type=int, default=8979)
     ap.add_argument("--planner", default="http://127.0.0.1:8968")
     ap.add_argument("--pilot", default="ws://100.80.98.4:8971/")
+    ap.add_argument("--upload", default="http://100.80.98.4:8966")
     asyncio.run(main_async(ap.parse_args()))
 
 

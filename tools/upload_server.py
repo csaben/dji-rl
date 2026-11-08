@@ -12,6 +12,7 @@ import datetime as dt
 import html
 import json
 import os
+import threading
 import re
 import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -115,12 +116,9 @@ class Handler(BaseHTTPRequestHandler):
 
         dest_dir = ROOT / date / source
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / name
-        if dest.exists():  # never overwrite raw data; keep both
-            stem, suf, i = dest.stem, dest.suffix, 1
-            while (dest_dir / f"{stem}_{i}{suf}").exists():
-                i += 1
-            dest = dest_dir / f"{stem}_{i}{suf}"
+        if "total" in q:
+            return self._put_part(q, dest_dir, name, length)
+        dest = _unique(dest_dir / name)
         part = dest.with_name(dest.name + ".part")
 
         remaining = length
@@ -138,6 +136,62 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(500, {"error": str(e)})
         self.log_message("saved %s (%d bytes)", dest, length)
         return self._json(200, {"path": str(dest.relative_to(ROOT.parent.parent)), "bytes": length})
+
+
+def _unique(dest: Path) -> Path:
+    """never overwrite raw data; keep both"""
+    if not dest.exists():
+        return dest
+    stem, suf, i = dest.stem, dest.suffix, 1
+    while (dest.parent / f"{stem}_{i}{suf}").exists():
+        i += 1
+    return dest.parent / f"{stem}_{i}{suf}"
+
+
+def _put_part(self, q, dest_dir: Path, name: str, length: int):
+    """resumable upload in parts (for the Cloudflare gateway's 100 MB request cap):
+    PUT /upload?date&source&name&offset=<byte>&total=<bytes>, body = the part.
+    offset=0 starts over; later parts must start at the current size, else 409 {"have": size} so the client
+    resumes from there. 200 {"done": false, "have"} after each part, {"done": true, "path", "bytes"} once
+    size == total (the file is then moved into place, never overwriting an existing one)."""
+    try:
+        offset, total = int(q.get("offset", "0")), int(q["total"])
+    except ValueError:
+        return self._json(400, {"error": "offset/total must be integers"})
+    if total <= 0 or offset < 0 or offset + length > total:
+        return self._json(400, {"error": "bad offset/total"})
+    if offset == 0 and free_bytes() - total < MIN_FREE:
+        return self._json(507, {"error": f"not enough disk space ({free_bytes() / 1e9:.0f} GB free)"})
+    part = dest_dir / f".{name}.upload"
+    with _LOCK:
+        have = part.stat().st_size if part.exists() else 0
+        if offset != 0 and offset != have:
+            return self._json(409, {"have": have})
+        try:
+            with open(part, "wb" if offset == 0 else "ab") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(CHUNK, remaining))
+                    if not chunk:
+                        raise ConnectionError("client disconnected")
+                    f.write(chunk)
+                    remaining -= len(chunk)
+        except Exception as e:  # noqa: BLE001  keep what arrived; the client resumes from "have"
+            return self._json(500, {"error": str(e), "have": part.stat().st_size if part.exists() else 0})
+        have = part.stat().st_size
+        if have < total:
+            return self._json(200, {"done": False, "have": have})
+        if have > total:
+            part.unlink()
+            return self._json(409, {"have": 0, "error": "file grew past total; start over"})
+        dest = _unique(dest_dir / name)
+        part.rename(dest)
+    self.log_message("saved %s (%d bytes, in parts)", dest, total)
+    return self._json(200, {"done": True, "path": str(dest.relative_to(ROOT.parent.parent)), "bytes": total})
+
+
+Handler._put_part = _put_part
+_LOCK = threading.Lock()
 
 
 def main():
