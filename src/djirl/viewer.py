@@ -336,6 +336,8 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                 if what == "occupancy":
                     return self._send(200, api.occupancy_png(name, float(q.get("alt", 5)), float(q.get("clear", 1.5)), px),
                                       "image/png", {"X-Bounds": json.dumps(api.topdown_meta(name, px))})
+                if what.startswith("race/"):
+                    return self._race_get(what[len("race/"):], q)
                 if what == "traj":
                     t = api.trajs.get(q.get("id", ""))
                     return self._json(200 if t else 404, t or {"error": "unknown id"})
@@ -347,8 +349,28 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                     torch.cuda.empty_cache()
                 return self._json(503 if isinstance(e, torch.OutOfMemoryError) else 500, {"error": f"{type(e).__name__}: {e}"})
 
+        def _race_get(self, what, q):
+            from . import race_jobs
+            if what == "jobs":
+                return self._json(200, race_jobs.list_jobs())
+            if what.startswith("jobs/"):
+                st = race_jobs.status(what[len("jobs/"):])
+                return self._json(200 if st else 404, st or {"error": "unknown job"})
+            if what == "ghost":
+                g = race_jobs.ghost(job=q.get("job"), course=q.get("course"))
+                return self._json(200 if g else 404, g or {"error": "no ghost yet"})
+            return self._json(404, {"error": f"unknown race endpoint {what}"})
+
         def do_POST(self):
             u = urlparse(self.path)
+            if u.path == "/api/sim/race/train":
+                from . import race_jobs
+                try:
+                    req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                    code, out = race_jobs.start(req.get("course") or {}, float(req.get("minutes", 10)))
+                    return self._json(code, out)
+                except Exception as e:  # noqa: BLE001
+                    return self._json(400, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             if u.path != "/api/sim/fly":
                 return self._json(404, {"error": "not found"})
             try:

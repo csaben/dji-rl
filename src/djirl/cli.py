@@ -249,6 +249,12 @@ def main():
     p.add_argument("--speed-cap", type=float, default=4.0, help="m/s cap on the policy's horizontal command")
     p.add_argument("--log-dir", default="runs/pilot")
     p.set_defaults(f=cmd_pilot_serve)
+    p = sub.add_parser("race-train", help="train a state-based racing agent on a gate course; writes status.json/ghost.json")
+    p.add_argument("--course", required=True); p.add_argument("--out", required=True)
+    p.add_argument("--minutes", type=float, default=10); p.add_argument("--envs", type=int, default=2048)
+    p.add_argument("--device", default="cuda:1")
+    p.set_defaults(f=lambda a: __import__("djirl.race", fromlist=["train"]).train(
+        json.loads(Path(a.course).read_text()), Path(a.out), a.minutes, a.device, a.envs))
     a = ap.parse_args()
     a.f(a)
 
