@@ -289,6 +289,7 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
     api = SimAPI(device)
     scene = scene.to(device)
     api.scenes[scene.name] = scene
+    threading.Thread(target=api.list_scenes, daemon=True, name="warm-scene-bounds").start()
     sess = Session(scene, device, api=api)
     splats = REPO / "data" / "splats"
     # optional per-client sessions (?sid=...): own drone/mode/replay state, shared scene + GPU lock;

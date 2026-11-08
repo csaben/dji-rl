@@ -88,8 +88,18 @@ class SimAPI:
             out.append({"name": d.name, "bounds": b, "geo": geo})
         return out
 
+    _BOUNDS: dict = {}
+
+    @classmethod
+    def _bounds_from_disk(cls, d: Path) -> dict:
+        f = d / "esdf.npz"
+        key = (str(f), f.stat().st_mtime_ns)
+        if key not in cls._BOUNDS:                 # loading the npz to read the grid is ~0.5 s per scene
+            cls._BOUNDS[key] = cls._bounds_npz(d)
+        return cls._BOUNDS[key]
+
     @staticmethod
-    def _bounds_from_disk(d: Path) -> dict:
+    def _bounds_npz(d: Path) -> dict:
         z = np.load(d / "esdf.npz")
         lo = z["origin"]
         hi = lo + float(z["voxel"]) * (np.array(z["sdf"].shape) - 1)
