@@ -119,9 +119,39 @@ class ScriptedPilot:
         return a.clamp(-1, 1)
 
 
+class RoutePilot:
+    """Route task: the map planner's pure pursuit (what flies at deployment) at a per-episode cruise speed,
+    with lateral/heading noise, straight into the unmapped obstacles. Never avoids anything."""
+
+    def __init__(self, env, v_range=(1.0, 8.0), seed=0):
+        self.env, self.v_range = env, v_range
+        self.g = torch.Generator(device=env.dev).manual_seed(seed)
+        self.cruise = torch.zeros(env.n, device=env.dev)
+        self.noise = torch.zeros(env.n, 4, device=env.dev)
+        self.reroll(torch.ones(env.n, dtype=torch.bool, device=env.dev))
+
+    def reroll(self, mask):
+        m = int(mask.sum())
+        if m:
+            lo, hi = self.v_range
+            self.cruise[mask] = lo + (hi - lo) * torch.rand(m, device=self.env.dev, generator=self.g)
+            self.noise[mask] = torch.randn(m, 4, device=self.env.dev, generator=self.g) * torch.tensor([0.03, 0.08, 0.05, 0.1], device=self.env.dev)
+
+    def act(self):
+        env = self.env
+        g = env.goal - env.dyn.pos
+        P = env.cfg.stick
+        v = torch.minimum(self.cruise, (6.0 * (env.rpts[env.r_id, env.r_end] - env.dyn.pos).norm(dim=-1)).sqrt())
+        body = env._to_body(torch.nn.functional.normalize(g, dim=-1) * v[:, None])
+        err = torch.remainder(torch.atan2(g[:, 1], g[:, 0]) - env.dyn.yaw + math.pi, 2 * math.pi) - math.pi
+        a = torch.stack([body[:, 0] / P.v_h_max, body[:, 1] / P.v_h_max, (body[:, 2] / P.v_up_max).clamp(-1, 1),
+                         (-err * 1.5).clamp(-1, 1)], -1)
+        return (a + self.noise + 0.03 * torch.randn(a.shape, device=env.dev, generator=self.g)).clamp(-1, 1)
+
+
 def collect(env, n_frames: int, out: Path, brake: BrakeModel, seed: int = 0, log_every: int = 50) -> Path:
-    """Run the scripted pilot and save (latent stack, proprio, labels) for hazard training."""
-    pilot = ScriptedPilot(env, seed=seed)
+    """Run the scripted pilot (route pilot on the route task) and save (latent stack, proprio, labels)."""
+    pilot = RoutePilot(env, seed=seed) if env.cfg.task == "route" else ScriptedPilot(env, seed=seed)
     obs = env.reset()
     steps = math.ceil(n_frames / env.n)
     keys = ("latent", "vec")
@@ -136,6 +166,10 @@ def collect(env, n_frames: int, out: Path, brake: BrakeModel, seed: int = 0, log
             lab[k].append(lb[k].half().cpu())
         obs, r, done, info = env.step(pilot.act())
         pilot.reroll(done)
+        if env.cfg.task == "route" and i % 100 == 99:  # fresh unmapped obstacles
+            env.resample_obstacles()
+            obs = env.reset()
+            pilot.reroll(torch.ones_like(done))
         if i % log_every == 0:
             mb = torch.cat(lab["must_brake"]).float().mean().item()
             print(f"collect {i}/{steps} frames {(i + 1) * env.n} must_brake {mb:.3f} {time.time() - t0:.0f}s", flush=True)

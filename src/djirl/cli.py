@@ -216,6 +216,8 @@ def main():
     p.add_argument("--frames", type=int, default=1_000_000); p.add_argument("--out"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--latency", type=float, default=0.30); p.add_argument("--a-brake", type=float, default=5.0)
     p.add_argument("--margin", type=float, default=1.5); p.set_defaults(f=cmd_hazard_collect)
+    p.add_argument("--task", choices=["loop", "a2b", "route"], default="loop"); p.add_argument("--ceiling", type=float, default=30.0)
+    p.add_argument("--radius-clip", type=float, default=0.0); p.add_argument("--full-frac", type=float, default=1.0)
     p = sub.add_parser("hazard-train", parents=[common], help="train the hazard model on collected data")
     p.add_argument("data"); p.add_argument("--name"); p.add_argument("--epochs", type=int, default=8)
     p.set_defaults(f=cmd_hazard_train)
