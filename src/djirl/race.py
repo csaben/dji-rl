@@ -7,7 +7,7 @@ times are directly comparable with a human time trial in the sandbox.
 
 Course (scene frame, metres; same as the planner's /api/lib/races/<slug>):
   {"name", "scene", "laps": 1, "gates": [{"x","y","z","yaw_deg","diameter_m"}, ...],
-   "start": {"x","y","z","yaw_deg"} (optional; default 7 m before gate 1, facing through it, hovering)}
+   "start": {"x","y","z","yaw_deg"} (optional; default 4 m before gate 1, facing through it, hovering)}
 Timing (= the sandbox time trial): the clock starts when gate 1 is passed; splits are the later gates'
 pass times from there, time_s the last one. Ghost traj t is on that clock (the run-up has t < 0).
 yaw_deg: math angle (0 = +x east, CCW), the direction you fly THROUGH the gate.
@@ -36,7 +36,7 @@ REPO = Path(__file__).resolve().parents[2]
 DRONE_R = 0.25
 HZ = 10.0
 GATE_TIMEOUT_S = 10.0      # no pass for this long -> episode fails
-START_BEHIND_M = 7.0       # default spawn: this far before gate 1 on its axis, facing through it (= the sandbox)
+START_BEHIND_M = 4.0       # default spawn: this far before gate 1 on its axis, facing through it (= the sandbox)
 
 
 def course_hash(c: dict) -> str:
