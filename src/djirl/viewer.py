@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import math
 import threading
 import time
@@ -420,6 +421,8 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                                       "image/png", {"X-Bounds": json.dumps(api.topdown_meta(name, px))})
                 if what.startswith("race/"):
                     return self._race_get(what[len("race/"):], q)
+                if what.startswith("splat/"):
+                    return self._splat_get(what[len("splat/"):], q)
                 if what == "traj":
                     t = api.trajs.get(q.get("id", ""))
                     return self._json(200 if t else 404, t or {"error": "unknown id"})
@@ -443,8 +446,32 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                 return self._json(200 if g else 404, g or {"error": "no ghost yet"})
             return self._json(404, {"error": f"unknown race endpoint {what}"})
 
+        def _splat_get(self, what, q):
+            from . import splat_jobs
+            if what == "jobs":
+                return self._json(200, splat_jobs.list_jobs())
+            if what.startswith("jobs/"):
+                job = what[len("jobs/"):]
+                st = splat_jobs.status(job)
+                if st and q.get("log"):
+                    st["log"] = splat_jobs.log_tail(job, int(q.get("log", 60)))
+                return self._json(200 if st else 404, st or {"error": "unknown job"})
+            return self._json(404, {"error": f"unknown splat endpoint {what}"})
+
         def do_POST(self):
             u = urlparse(self.path)
+            if u.path.startswith("/api/sim/splat/jobs"):
+                from . import splat_jobs
+                try:
+                    req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                    if u.path == "/api/sim/splat/jobs":
+                        return self._json(*splat_jobs.start(req))
+                    m = re.match(r"^/api/sim/splat/jobs/([^/]+)/cancel$", u.path)
+                    if m:
+                        return self._json(*splat_jobs.cancel(m.group(1)))
+                    return self._json(404, {"error": "not found"})
+                except Exception as e:  # noqa: BLE001
+                    return self._json(400, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             if u.path == "/api/sim/course":
                 from . import race_jobs
                 try:

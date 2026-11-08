@@ -217,7 +217,8 @@ def do_capture(stream: Path, fps: float, width: int | None, latency_ms: float) -
         "t_ns": ("t_ns",), "latitude": ("lat", "latitude"), "longitude": ("lon", "longitude", "lng"),
         "alt_gps": ("alt_gps", "altitude"), "rel_alt": ("alt_rel", "rel_alt", "relative_altitude"),
         "vel_n": ("vel_n", "vn", "velocity_n"), "vel_e": ("vel_e", "ve", "velocity_e"), "vel_d": ("vel_d", "vd", "velocity_d"),
-        "att_yaw": ("att_yaw", "yaw"), "att_pitch": ("att_pitch", "pitch"), "att_roll": ("att_roll", "roll"),
+        "att_yaw": ("att_yaw", "yaw_deg", "yaw"), "att_pitch": ("att_pitch", "pitch_deg", "pitch"),
+        "att_roll": ("att_roll", "roll_deg", "roll"),
         "gimbal_pitch": ("gimbal_pitch",), "gimbal_yaw": ("gimbal_yaw",), "gimbal_roll": ("gimbal_roll",)}.items()}
     print("telemetry columns:", {k: (th[v] if v is not None else None) for k, v in cols.items()})
     if cols["t_ns"] is None or cols["latitude"] is None:
@@ -250,9 +251,17 @@ def do_capture(stream: Path, fps: float, width: int | None, latency_ms: float) -
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", fmt, "-i", str(stream),
                     "-vsync", "passthrough", *vf, "-q:v", "2", str(frames_dir / "%06d.jpg")], check=True)
     decoded = sorted(frames_dir.glob("*.jpg"))
-    n = min(len(decoded), len(t_frame))
-    if len(decoded) != len(t_frame):
-        print(f"warning: {len(decoded)} decoded frames vs {len(t_frame)} packet rows; pairing the first {n} in order")
+    # frames before the first SPS/PPS (keyframe) can't be decoded, so the decoder output lines up with the
+    # LAST len(decoded) packet rows, not the first
+    off = max(0, len(t_frame) - len(decoded))
+    kcol = _col(vh, "keyframe")
+    first_key = next((i for i, r in enumerate(vrows) if kcol is not None and r[kcol] == "1"), 0)
+    if off:
+        print(f"note: {len(decoded)} decoded frames vs {len(t_frame)} packet rows; skipping the first {off} rows "
+              f"(first keyframe at row {first_key})")
+    t_frame = t_frame[off:]
+    decoded = decoded[:len(t_frame)]
+    n = len(decoded)
     # subsample to `fps` by arrival time, attach interpolated telemetry
     final = out / "frames"
     final.mkdir(exist_ok=True)
@@ -264,12 +273,12 @@ def do_capture(stream: Path, fps: float, width: int | None, latency_ms: float) -
         if next_t is not None and t < next_t:
             continue
         row = {"file": f"frames/{len(rows) + 1:06d}.jpg", "t": round((t - t0) / 1e9, 4), "t_ns": t, "t_arrival_ns": t_frame[i],
-               "latency_ms": latency_ms, "src_frame": i}
+               "latency_ms": latency_ms, "src_frame": i + off}
         for k in V:
             v = interp(k, t)
             if v is not None and v == v:
                 row[k] = v
-        if "latitude" not in row:
+        if "latitude" not in row or abs(row["latitude"]) < 1e-6:    # no GPS fix yet
             continue
         next_t = t + int(1e9 / fps)
         decoded[i].replace(final / f"{len(rows) + 1:06d}.jpg")
