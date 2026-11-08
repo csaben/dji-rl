@@ -243,7 +243,7 @@ def main():
         tuple(a.pilots.split(",")), a.chunk, a.out, a.seed,
         tuple(float(x) for x in a.lookahead.split(","))))
     p = sub.add_parser("pilot-serve", help="live hazard trigger + policy for the phone mission runner (docs/pilot-protocol.md)")
-    p.add_argument("--ckpt", default="runs/route-wlref-2/policy.pt"); p.add_argument("--hazard-ckpt", default="runs/hazard-wlref/hazard.pt")
+    p.add_argument("--ckpt", default="runs/route-wlref-3/snap3.pt"); p.add_argument("--hazard-ckpt", default="runs/hazard-wlref/hazard.pt")
     p.add_argument("--device", default="cuda:1"); p.add_argument("--host", default="100.80.98.4"); p.add_argument("--port", type=int, default=8971)
     p.add_argument("--thr", type=float, default=0.5); p.add_argument("--lookahead", type=float, default=4.0)
     p.add_argument("--speed-cap", type=float, default=4.0, help="m/s cap on the policy's horizontal command")

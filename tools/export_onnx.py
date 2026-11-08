@@ -1,7 +1,7 @@
 """Export the on-phone pilot stack (TAESD encoder + hazard net + policy actor) as one ONNX graph,
 check it against PyTorch, and time it on CPU.
 
-    .venv/bin/python tools/export_onnx.py --ckpt runs/route-wlref-2/policy.pt --hazard runs/hazard-wlref/hazard.pt \
+    .venv/bin/python tools/export_onnx.py --ckpt runs/route-wlref-3/snap3.pt --hazard runs/hazard-wlref/hazard.pt \
         --out runs/onnx/pilot.onnx
 
 Graph (batch 1, float32):
@@ -40,7 +40,7 @@ class PilotGraph(torch.nn.Module):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ckpt", default="runs/route-wlref-2/policy.pt")
+    ap.add_argument("--ckpt", default="runs/route-wlref-3/snap3.pt")
     ap.add_argument("--hazard", default="runs/hazard-wlref/hazard.pt")
     ap.add_argument("--out", default="runs/onnx/pilot.onnx")
     a = ap.parse_args()
