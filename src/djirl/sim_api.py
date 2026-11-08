@@ -52,6 +52,25 @@ class SimAPI:
             self.scenes[name] = load_scene(SPLATS / name).to(self.dev)
         return self.scenes[name]
 
+    @torch.no_grad()
+    def view_gaussians(self, s: Scene):
+        """Splat for the replay/viewer cameras with the sky shell and haze culled: drop Gaussians above the
+        collision grid (zmax), and Gaussians > 6 m above the local terrain that are sky-coloured (bright or
+        grey DC). World Labs scenes wrap the capture in a sky dome / haze that otherwise fills the view above
+        ~15 m. Cached per scene. Viewer only: training renders are unchanged."""
+        key = ("view_g", s.name)
+        if key not in self.cache:
+            from .scene import SH_C0, Gaussians
+            g = s.gaussians
+            m = g.means
+            ter = torch.cat([self._terrain_at(s, m[i:i + 500000, 0], m[i:i + 500000, 1]) for i in range(0, len(m), 500000)])
+            rgb = (g.sh[:, 0] * SH_C0 + 0.5).clamp(0, 1)
+            sat = rgb.max(1).values - rgb.min(1).values
+            drop = (m[:, 2] > s.esdf.upper[2]) | ((m[:, 2] - ter > 6.0) & ((rgb.mean(1) > 0.45) | (sat < 0.12)))
+            k = ~drop
+            self.cache[key] = Gaussians(g.means[k], g.quats[k], g.scales[k], g.opacities[k], g.sh[k])
+        return self.cache[key]
+
     def bounds(self, name: str) -> dict:
         e = self.scene(name).esdf
         lo, hi = e.origin.tolist(), e.upper.tolist()

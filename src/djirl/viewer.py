@@ -43,6 +43,8 @@ class Session:
     def load_scene(self, scene: Scene):
         self.scene = scene.to(self.dev)
         g = self.scene.gaussians
+        if getattr(self, "api", None) is not None:  # sky shell / haze culled for viewing
+            g = self.api.view_gaussians(self.scene)
         self.hd = Renderer(g, 960, 540, 82.0, chunk=1)
         self.sim = Renderer(g, 128, 96, 82.0, chunk=1)
         self.params = StickParams(dr=0.0, wind_std=0.0, delay_steps=6)  # 30 Hz manual: 6 steps = 200 ms
@@ -237,6 +239,7 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
     api.scenes[scene.name] = scene
     sess = Session(scene, device)
     sess.api = api
+    sess.load_scene(scene)
     splats = REPO / "data" / "splats"
 
     class H(BaseHTTPRequestHandler):
