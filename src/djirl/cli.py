@@ -38,6 +38,8 @@ def _env(args, n=None):
         cfg.route_lead_m = tuple(float(x) for x in args.route_lead.split(","))
     if getattr(args, "route_speed0", None) is not None:
         cfg.route_speed0 = args.route_speed0
+    if getattr(args, "route_takeover_frac", None) is not None:
+        cfg.route_takeover_frac = args.route_takeover_frac
     if getattr(args, "route_obstacle_frac", None) is not None:
         cfg.route_obstacle_frac = args.route_obstacle_frac
     return BatchEnv(_scene(args.scene), cfg, device=args.device)
@@ -202,6 +204,8 @@ def main():
             p.add_argument("--route-lead", help="lo,hi m before the obstacle at spawn (default 8,18)")
             p.add_argument("--route-speed0", type=float, help="spawn speed ~ U(0, this) (default 4)")
             p.add_argument("--route-obstacle-frac", type=float)
+            p.add_argument("--route-takeover-frac", type=float,
+                           help="obstacle episodes spawned like a handoff: cruise 2-8 m/s, stopping distance + 0-10 m out")
         if name == "rollout":
             p.add_argument("--ckpt"); p.add_argument("--out", default="rollout.mp4"); p.add_argument("--seconds", type=int, default=30)
         if name == "preview":

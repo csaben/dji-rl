@@ -66,6 +66,11 @@ class EnvConfig:
     route_lead_m: tuple = (8.0, 18.0)     # obstacle episodes start this far before the obstacle
     route_tail_m: tuple = (10.0, 20.0)    # and end this far after it
     route_speed0: float = 4.0             # initial speed ~ U(0, this)
+    # handoff-matched spawns: a fraction of obstacle episodes start where the hazard trigger would hand
+    # over: moving at cruise speed along the route, stopping distance + lookahead before the obstacle
+    route_takeover_frac: float = 0.0
+    route_takeover_speed: tuple = (2.0, 8.0)
+    route_takeover_look_m: tuple = (0.0, 10.0)
     stick: StickParams = field(default_factory=StickParams)
 
 
@@ -166,7 +171,12 @@ class BatchEnv:
         r = torch.where(use_ob, r_ob, r_rand)
         L = self.rlen[r]
         U = lambda r: r[0] + (r[1] - r[0]) * torch.rand(m, device=dev)
-        lead = (U(cfg.route_lead_m) / sp).long()
+        lead_m = U(cfg.route_lead_m)
+        tko = use_ob & (torch.rand(m, device=dev) < cfg.route_takeover_frac)
+        v_tk = U(cfg.route_takeover_speed)
+        stop = v_tk * 0.30 + v_tk ** 2 / (2 * 5.0) + 1.5                              # hazard.BrakeModel defaults
+        lead_m = torch.where(tko, stop + U(cfg.route_takeover_look_m) + 1.0, lead_m)  # +1: obstacle centre -> surface
+        lead = (lead_m / sp).long()
         tail = (U(cfg.route_tail_m) / sp).long()
         s0_ob = (i_ob - lead).clamp(min=0)
         e_ob = torch.minimum(i_ob + tail, L - 1)
@@ -178,9 +188,10 @@ class BatchEnv:
         p = self.rpts[r, s0].clone()
         nxt = self.rpts[r, torch.minimum(s0 + 4, L - 1)]
         tan = nxt - p
-        yaw = torch.atan2(tan[:, 1], tan[:, 0]) + torch.randn(m, device=dev) * 0.25
+        yaw = torch.atan2(tan[:, 1], tan[:, 0]) + torch.randn(m, device=dev) * torch.where(tko, 0.1, 0.25)
         p[:, :2] += torch.randn(m, 2, device=dev) * 0.4
         speed0 = torch.rand(m, device=dev) * cfg.route_speed0                           # often already moving, like mid-route
+        speed0 = torch.where(tko, v_tk, speed0)
         v0 = torch.stack([torch.cos(yaw), torch.sin(yaw), torch.zeros_like(yaw)], -1) * speed0[:, None]
         return p, yaw, v0, r, s0, e, use_ob
 
