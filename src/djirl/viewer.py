@@ -148,7 +148,7 @@ class Session:
         """Same contact test as BatchEnv (swept sub-steps vs drone radius 0.25 m against the scene ESDF).
         Normal mode blocks and bounces; explore (noclip) passes through but still counts and flashes.
         A hit is counted once per contact (edge), not every frame spent touching."""
-        n = max(1, min(6, round(dt * 30)))
+        n = max(1, min(15, round(dt * 30)))
         a = torch.tensor([sticks], device=self.dev, dtype=torch.float32)
         touching = False
         for _ in range(n):
@@ -224,7 +224,7 @@ class Session:
               gates=None, next_gate=0):
         with self.lock:
             now = time.time()
-            dt = min(now - self.last_t, 0.2)
+            dt = min(now - self.last_t, 0.5)   # manual keeps up with wall clock down to ~2 fps
             self.last_t = now
             self.pitch_deg = pitch_deg
             replay_info = None
@@ -232,6 +232,8 @@ class Session:
                 pos, vel, yaw, t, dur = self._replay_pose(t_override)
                 self.dyn.pos, self.dyn.vel, self.dyn.yaw = pos, vel, yaw
                 replay_info = {"id": self.replay["id"], "t": round(t, 2), "duration": dur,
+                               **({"race_t": round(t + self.replay["race_t0"], 2), "time_s": self.replay["time_s"]}
+                                  if "race_t0" in self.replay else {}),
                                "paused": self.replay_fixed is not None, "poi": self.replay_poi,
                                "gimbal_pitch_deg": self.replay_gimbal}
                 if self.replay_gimbal is not None:
@@ -340,6 +342,17 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
             sess = get_sess(q)
             if u.path == "/replay":
                 tid = q.get("id", "")
+                if q.get("ghost"):                 # watch the AI: a race ghost through the normal replay path
+                    tid = f"ghost:{q['ghost']}"
+                    if not (q.get("t") is not None and sess.mode == "replay" and sess.replay["id"] == tid):
+                        from . import race_jobs
+                        g = race_jobs.ghost_replay(q["ghost"])
+                        if g is None:
+                            return self._send(404, b"no ghost for that job / course", "text/plain")
+                        g["id"] = tid
+                        api.trajs[tid] = g
+                    else:
+                        api.trajs[tid] = sess.replay
                 if tid not in api.trajs:
                     return self._send(404, b"unknown trajectory id", "text/plain")
                 with sess.lock:

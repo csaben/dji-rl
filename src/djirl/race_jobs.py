@@ -138,3 +138,35 @@ def course_by_key(key: str):
             _COURSES[key] = c
             return c
     return None
+
+
+def ghost_replay(key: str):
+    """Ghost (job id, course hash or library slug) -> a viewer replay trajectory: 0.1 s samples
+    {t,x,y,z,vx,vy,vz,yaw}, replay t = race t - t_start (the run-up has race t < 0)."""
+    import math
+    g = ghost(job=key) if key.startswith("r_") else ghost(course=key)
+    if not g or not g.get("traj"):
+        return None
+    course = course_by_key(g["course_hash"]) or (course_by_key(key) if not key.startswith("r_") else None)
+    if course is None and g.get("job"):
+        f = JOBS / g["job"] / "course.json"
+        course = json.loads(f.read_text()) if f.exists() else None
+    if course is None:
+        return None
+    tr = g["traj"]
+    t0, t1 = tr[0][0], tr[-1][0]
+    out, j = [], 0
+    n = int(round((t1 - t0) / 0.1)) + 1
+    for k in range(n):
+        t = t0 + k * 0.1
+        while j < len(tr) - 2 and tr[j + 1][0] <= t:
+            j += 1
+        a, b = tr[j], tr[min(j + 1, len(tr) - 1)]
+        dt = b[0] - a[0]
+        w = 0.0 if dt <= 0 else min(max((t - a[0]) / dt, 0.0), 1.0)
+        dy = (b[4] - a[4] + math.pi) % (2 * math.pi) - math.pi
+        v = [(b[i] - a[i]) / dt if dt > 0 else 0.0 for i in (1, 2, 3)]
+        out.append({"t": round(k * 0.1, 2), **{c: a[i] * (1 - w) + b[i] * w for c, i in (("x", 1), ("y", 2), ("z", 3))},
+                    "vx": v[0], "vy": v[1], "vz": v[2], "yaw": a[4] + w * dy})
+    return {"id": f"ghost:{g.get('job', key)}", "scene": course["scene"], "traj": out, "race_t0": round(t0, 2),
+            "time_s": g["time_s"], "splits": g.get("splits"), "course_hash": g["course_hash"], "job": g.get("job")}
