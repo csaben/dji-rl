@@ -34,6 +34,12 @@ def _env(args, n=None):
     cfg = EnvConfig(num_envs=n or args.envs, render_chunk=args.chunk, task=getattr(args, "task", "loop"),
                     ceiling=getattr(args, "ceiling", 30.0), radius_clip=getattr(args, "radius_clip", 0.0),
                     full_quality_frac=getattr(args, "full_frac", 1.0))
+    if getattr(args, "route_lead", None):
+        cfg.route_lead_m = tuple(float(x) for x in args.route_lead.split(","))
+    if getattr(args, "route_speed0", None) is not None:
+        cfg.route_speed0 = args.route_speed0
+    if getattr(args, "route_obstacle_frac", None) is not None:
+        cfg.route_obstacle_frac = args.route_obstacle_frac
     return BatchEnv(_scene(args.scene), cfg, device=args.device)
 
 
@@ -193,6 +199,9 @@ def main():
         if name == "train":
             p.add_argument("--minutes", type=float, default=90); p.add_argument("--name")
             p.add_argument("--horizon", type=int, default=32); p.add_argument("--resume")
+            p.add_argument("--route-lead", help="lo,hi m before the obstacle at spawn (default 8,18)")
+            p.add_argument("--route-speed0", type=float, help="spawn speed ~ U(0, this) (default 4)")
+            p.add_argument("--route-obstacle-frac", type=float)
         if name == "rollout":
             p.add_argument("--ckpt"); p.add_argument("--out", default="rollout.mp4"); p.add_argument("--seconds", type=int, default=30)
         if name == "preview":
@@ -210,6 +219,17 @@ def main():
     p = sub.add_parser("hazard-train", parents=[common], help="train the hazard model on collected data")
     p.add_argument("data"); p.add_argument("--name"); p.add_argument("--epochs", type=int, default=8)
     p.set_defaults(f=cmd_hazard_train)
+    p = sub.add_parser("handoff", parents=[common], help="planner -> policy -> planner handoff eval on obstacle missions")
+    p.add_argument("--scene", default="house-worldlabs-refined"); p.add_argument("--ckpt", required=True)
+    p.add_argument("--episodes", type=int, default=512); p.add_argument("--envs", type=int, default=256)
+    p.add_argument("--trigger", choices=["oracle", "net"], default="oracle"); p.add_argument("--hazard-ckpt")
+    p.add_argument("--thr", type=float, default=0.5); p.add_argument("--cruise", type=float, default=5.0)
+    p.add_argument("--pilots", default="planner,policy,handoff"); p.add_argument("--out"); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--lookahead", default="0", help="comma list of extra trigger metres beyond stopping distance")
+    p.set_defaults(f=lambda a: __import__("djirl.handoff", fromlist=["evaluate"]).evaluate(
+        _scene(a.scene), a.ckpt, a.episodes, a.envs, a.device, a.trigger, a.hazard_ckpt, a.thr, a.cruise,
+        tuple(a.pilots.split(",")), a.chunk, a.out, a.seed,
+        tuple(float(x) for x in a.lookahead.split(","))))
     a = ap.parse_args()
     a.f(a)
 

@@ -63,6 +63,9 @@ class EnvConfig:
     route_xtrack_free: float = 1.5        # m off-route before a penalty applies (dodging is allowed)
     w_xtrack: float = 0.05
     route_seg_m: tuple = (15.0, 35.0)     # segment length for obstacle-free episodes
+    route_lead_m: tuple = (8.0, 18.0)     # obstacle episodes start this far before the obstacle
+    route_tail_m: tuple = (10.0, 20.0)    # and end this far after it
+    route_speed0: float = 4.0             # initial speed ~ U(0, this)
     stick: StickParams = field(default_factory=StickParams)
 
 
@@ -162,8 +165,9 @@ class BatchEnv:
         r_rand = torch.randint(0, len(self.rpts), (m,), device=dev)
         r = torch.where(use_ob, r_ob, r_rand)
         L = self.rlen[r]
-        lead = ((8 + 10 * torch.rand(m, device=dev)) / sp).long()          # start 8-18 m before the obstacle
-        tail = ((10 + 10 * torch.rand(m, device=dev)) / sp).long()         # and end 10-20 m after it
+        U = lambda r: r[0] + (r[1] - r[0]) * torch.rand(m, device=dev)
+        lead = (U(cfg.route_lead_m) / sp).long()
+        tail = (U(cfg.route_tail_m) / sp).long()
         s0_ob = (i_ob - lead).clamp(min=0)
         e_ob = torch.minimum(i_ob + tail, L - 1)
         seg = ((cfg.route_seg_m[0] + (cfg.route_seg_m[1] - cfg.route_seg_m[0]) * torch.rand(m, device=dev)) / sp).long()
@@ -176,7 +180,7 @@ class BatchEnv:
         tan = nxt - p
         yaw = torch.atan2(tan[:, 1], tan[:, 0]) + torch.randn(m, device=dev) * 0.25
         p[:, :2] += torch.randn(m, 2, device=dev) * 0.4
-        speed0 = torch.rand(m, device=dev) * 4.0                            # often already moving, like mid-route
+        speed0 = torch.rand(m, device=dev) * cfg.route_speed0                           # often already moving, like mid-route
         v0 = torch.stack([torch.cos(yaw), torch.sin(yaw), torch.zeros_like(yaw)], -1) * speed0[:, None]
         return p, yaw, v0, r, s0, e, use_ob
 
