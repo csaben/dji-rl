@@ -4,7 +4,9 @@ behind the Cloudflare tunnel:
 
     internet -> Cloudflare -> cloudflared (cradle) -> 127.0.0.1:8979 (this) -> planner :8968 / pilot :8971
 
-Everything requires the gateway token (~/.config/dji-gateway/token, created on first run, never logged):
+Everything requires a key (created on first run, never logged): the owner key ~/.config/dji-gateway/token
+can do everything; the guest key ~/.config/dji-gateway/guest_token can use the app, sim and local splats
+but not World Labs splats, race training or the live pilot link (403, see guest_denied). Keys are sent as:
   - native calls:  `Authorization: Bearer <token>`
   - WebView/browser: open `/login?key=<token>&next=/` once (or the form at /login); it sets an HttpOnly
     Secure cookie and redirects, so pages, <img src=/sim/frame...> and WebSockets just work afterwards
@@ -34,36 +36,55 @@ from urllib.parse import urlencode
 import aiohttp
 from aiohttp import web
 
-TOKEN_FILE = Path.home() / ".config" / "dji-gateway" / "token"
+TOKEN_FILE = Path.home() / ".config" / "dji-gateway" / "token"            # owner: everything
+GUEST_FILE = Path.home() / ".config" / "dji-gateway" / "guest_token"      # guest: see GUEST_DENY
 COOKIE = "djigw"
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
-       "transfer-encoding", "upgrade", "host", "content-length"}
+       "transfer-encoding", "upgrade", "host", "content-length", "expect"}
 
 LOGIN = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Flight Lab</title><body style="font:16px system-ui;max-width:420px;margin:15vh auto;padding:0 16px">
-<h3>Flight Lab gateway</h3><form method=post action=/login><input type=hidden name=next value="{next}">
+<h3>Flight Lab</h3><form method=post action=/login><input type=hidden name=next value="{next}">
 <input name=key type=password placeholder="access key" autofocus style="width:100%;padding:10px;font-size:16px">
 <button style="margin-top:10px;padding:10px 16px;font-size:16px">Enter</button></form>{err}</body>"""
 
 
-def load_token() -> str:
-    if not TOKEN_FILE.exists():
-        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-        TOKEN_FILE.touch(mode=0o600)
-        TOKEN_FILE.write_text(secrets.token_urlsafe(32))
-    TOKEN_FILE.chmod(0o600)
-    return TOKEN_FILE.read_text().strip()
+def load_token(f: Path = TOKEN_FILE) -> str:
+    if not f.exists():
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.touch(mode=0o600)
+        f.write_text(secrets.token_urlsafe(32))
+    f.chmod(0o600)
+    return f.read_text().strip()
+
+
+def guest_denied(method: str, path: str, body: bytes) -> str | None:
+    """things a guest key can't do: anything that spends money, burns long GPU time or flies the drone"""
+    if path == "/pilot":
+        return "the live pilot link is owner-only"
+    if method == "POST" and path.endswith("/race/train"):
+        return "race training is owner-only"
+    if method == "POST" and "/splat" in path and b"worldlabs" in body.lower():
+        return "World Labs splats cost money: owner-only (local splats are fine)"
+    return None
 
 
 class Gate:
-    def __init__(self, token: str, planner: str, pilot: str):
-        self.token, self.planner, self.pilot = token, planner.rstrip("/"), pilot
+    def __init__(self, keys: dict[str, str], planner: str, pilot: str):
+        self.keys, self.planner, self.pilot = keys, planner.rstrip("/"), pilot
         self.fails: dict[str, deque] = defaultdict(deque)
         self.http: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------------ auth
-    def ok(self, s: str | None) -> bool:
-        return bool(s) and hmac.compare_digest(s.encode(), self.token.encode())
+    def ok(self, s: str | None) -> str | None:
+        """key -> role ('owner' | 'guest') or None"""
+        if not s:
+            return None
+        hit = None
+        for k, role in self.keys.items():
+            if hmac.compare_digest(s.encode(), k.encode()):
+                hit = role
+        return hit
 
     def client_ip(self, r: web.Request) -> str:
         return r.headers.get("CF-Connecting-IP") or r.remote or "?"
@@ -74,13 +95,13 @@ class Gate:
             q.popleft()
         return len(q) >= 20
 
-    def authed(self, r: web.Request) -> bool:
+    def authed(self, r: web.Request) -> str | None:
         h = r.headers.get("Authorization", "")
-        return (self.ok(h[7:].strip()) if h.lower().startswith("bearer ") else False) \
+        return (self.ok(h[7:].strip()) if h.lower().startswith("bearer ") else None) \
             or self.ok(r.cookies.get(COOKIE)) or self.ok(r.query.get("key"))
 
-    def set_cookie(self, resp: web.StreamResponse):
-        resp.set_cookie(COOKIE, self.token, max_age=180 * 86400, httponly=True, secure=True, samesite="Lax", path="/")
+    def set_cookie(self, resp: web.StreamResponse, key: str):
+        resp.set_cookie(COOKIE, key, max_age=180 * 86400, httponly=True, secure=True, samesite="Lax", path="/")
 
     @staticmethod
     def safe_next(n: str | None) -> str:
@@ -102,7 +123,7 @@ class Gate:
             return web.Response(status=401, text=LOGIN.format(next=nxt, err="<p style=color:#c33>wrong key</p>"),
                                 content_type="text/html")
         resp = web.HTTPFound(nxt)
-        self.set_cookie(resp)
+        self.set_cookie(resp, key)
         return resp
 
     # ------------------------------------------------------------------ proxy
@@ -114,7 +135,8 @@ class Gate:
         ip = self.client_ip(r)
         if self.blocked(ip):
             return web.Response(status=429, text="too many attempts, try again later")
-        if not self.authed(r):
+        role = self.authed(r)
+        if not role:
             if r.headers.get("Authorization") or r.query.get("key") or r.cookies.get(COOKIE):
                 self.fails[ip].append(time.time())      # count wrong keys, not missing ones
             if r.method == "GET" and "text/html" in r.headers.get("Accept", ""):
@@ -122,17 +144,26 @@ class Gate:
             return web.json_response({"error": "unauthorized"}, status=401)
         query = {k: v for k, v in r.query.items() if k != "key"}
         qs = ("?" + urlencode(query)) if query else ""
+        body = None
+        if role != "owner":
+            if r.method == "POST" and r.body_exists:
+                body = await r.read()
+            why = guest_denied(r.method, r.path, body or b"")
+            if why:
+                return web.json_response({"error": why, "ok": False}, status=403)
         if r.path == "/pilot":
             return await self.ws(r, self.pilot + qs)
         if r.headers.get("Upgrade", "").lower() == "websocket":
             return await self.ws(r, self.planner.replace("http", "ws", 1) + r.path + qs)
-        return await self.forward(r, self.planner + r.path + qs)
+        return await self.forward(r, self.planner + r.path + qs, body)
 
-    async def forward(self, r: web.Request, url: str):
+    async def forward(self, r: web.Request, url: str, body: bytes | None = None):
         hdrs = {k: v for k, v in r.headers.items() if k.lower() not in HOP and k.lower() not in ("authorization", "cookie")}
+        if body is None and r.content_length is not None:
+            hdrs["Content-Length"] = str(r.content_length)   # the planner reads bodies by Content-Length, not chunked
         hdrs["X-Forwarded-Proto"] = "https"
         hdrs["X-Forwarded-For"] = self.client_ip(r)
-        data = r.content if r.body_exists else None
+        data = body if body is not None else (r.content if r.body_exists else None)
         try:
             async with self.http.request(r.method, url, headers=hdrs, data=data, allow_redirects=False) as up:
                 resp = web.StreamResponse(status=up.status)
@@ -140,7 +171,7 @@ class Gate:
                     if k.lower() not in HOP and k.lower() != "content-encoding":
                         resp.headers.add(k, v)
                 if r.query.get("key") and self.ok(r.query.get("key")):
-                    self.set_cookie(resp)
+                    self.set_cookie(resp, r.query["key"])
                 if up.headers.get("Content-Length") and "Content-Encoding" not in up.headers:
                     resp.content_length = int(up.headers["Content-Length"])
                 await resp.prepare(r)
@@ -172,7 +203,7 @@ class Gate:
 
 
 async def main_async(a):
-    g = Gate(load_token(), a.planner, a.pilot)
+    g = Gate({load_token(TOKEN_FILE): "owner", load_token(GUEST_FILE): "guest"}, a.planner, a.pilot)
     g.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=600),
                                    auto_decompress=False)
     app = web.Application(client_max_size=4 * 1024 ** 3)
