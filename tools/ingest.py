@@ -263,7 +263,8 @@ def do_capture(stream: Path, fps: float, width: int | None, latency_ms: float) -
         t = t_frame[i] - int(latency_ms * 1e6)
         if next_t is not None and t < next_t:
             continue
-        row = {"file": f"frames/{len(rows) + 1:06d}.jpg", "t": round((t - t0) / 1e9, 4), "t_ns": t, "src_frame": i}
+        row = {"file": f"frames/{len(rows) + 1:06d}.jpg", "t": round((t - t0) / 1e9, 4), "t_ns": t, "t_arrival_ns": t_frame[i],
+               "latency_ms": latency_ms, "src_frame": i}
         for k in V:
             v = interp(k, t)
             if v is not None and v == v:
