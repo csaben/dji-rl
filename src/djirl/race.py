@@ -7,7 +7,9 @@ times are directly comparable with a human time trial in the sandbox.
 
 Course (scene frame, metres; same as the planner's /api/lib/races/<slug>):
   {"name", "scene", "laps": 1, "gates": [{"x","y","z","yaw_deg","diameter_m"}, ...],
-   "start": {"x","y","z","yaw_deg"} (optional; default 4 m before gate 0, facing it)}
+   "start": {"x","y","z","yaw_deg"} (optional; default 7 m before gate 1, facing through it, hovering)}
+Timing (= the sandbox time trial): the clock starts when gate 1 is passed; splits are the later gates'
+pass times from there, time_s the last one. Ghost traj t is on that clock (the run-up has t < 0).
 yaw_deg: math angle (0 = +x east, CCW), the direction you fly THROUGH the gate.
 Pass rule (same as the client): the segment between consecutive control-step positions crosses the
 gate plane in the forward direction, and the crossing point is within diameter/2 of the centre.
@@ -34,6 +36,7 @@ REPO = Path(__file__).resolve().parents[2]
 DRONE_R = 0.25
 HZ = 10.0
 GATE_TIMEOUT_S = 10.0      # no pass for this long -> episode fails
+START_BEHIND_M = 7.0       # default spawn: this far before gate 1 on its axis, facing through it (= the sandbox)
 
 
 def course_hash(c: dict) -> str:
@@ -68,7 +71,7 @@ class RaceEnv:
             self.start = torch.tensor([float(st["x"]), float(st["y"]), float(st["z"])], device=self.dev)
             self.start_yaw = math.radians(float(st.get("yaw_deg", math.degrees(float(yaw[0])))))
         else:
-            self.start = self.gc[0] - self.gn[0] * 4.0
+            self.start = self.gc[0] - self.gn[0] * START_BEHIND_M
             self.start_yaw = float(yaw[0])
         if float(self.esdf.query(self.start[None])[0]) < DRONE_R + 0.2:
             raise ValueError("start position is inside an obstacle (move gate 0 or set course.start)")
@@ -217,7 +220,10 @@ def evaluate(course, model, device, max_s=None):
             if ok:
                 xx = info["x"][0]
                 traj.append([round(t, 2), *[round(float(v), 3) for v in xx], traj[-1][-1]])
-            return ok, (round(t, 2) if ok else None), splits, traj, bool(info["collided"][0])
+            t0 = splits[0] if splits else 0.0
+            traj = [[round(r[0] - t0, 2), *r[1:]] for r in traj]
+            sp = [round(x - t0, 2) for x in splits]
+            return ok, (sp[-1] if ok else None), sp, traj, bool(info["collided"][0])
         p, y = env.dyn.pos[0], float(env.dyn.yaw[0])
         traj.append([round(t, 2), *[round(float(v), 3) for v in p], round(y, 4)])
     return False, None, splits, traj, False

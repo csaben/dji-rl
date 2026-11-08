@@ -29,15 +29,16 @@ PAGE = Path(__file__).with_name("viewer.html")
 
 
 class Session:
-    def __init__(self, scene: Scene, device: str):
+    def __init__(self, scene: Scene, device: str, api=None, lock=None):
         self.dev = torch.device(device)
-        self.lock = threading.Lock()
+        self.lock = lock or threading.Lock()     # shared GPU lock across sessions
+        self.api = api
         self.load_scene(scene)
         self.mode = "manual"
         self.policy = None
         self.policy_name = None
         self.env = None
-        self.api = None
+        self.last_used = time.time()
 
     # ---------------------------------------------------------------- scene / reset
     def load_scene(self, scene: Scene):
@@ -237,10 +238,25 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
     api = SimAPI(device)
     scene = scene.to(device)
     api.scenes[scene.name] = scene
-    sess = Session(scene, device)
-    sess.api = api
-    sess.load_scene(scene)
+    sess = Session(scene, device, api=api)
     splats = REPO / "data" / "splats"
+    # optional per-client sessions (?sid=...): own drone/mode/replay state, shared scene + GPU lock;
+    # no sid = the shared default session (old behaviour)
+    pool, pool_lock, IDLE_S = {}, threading.Lock(), 60.0
+
+    def get_sess(q):
+        sid = (q.get("sid") or "")[:64]
+        if not sid:
+            return sess
+        now = time.time()
+        with pool_lock:
+            for k in [k for k, v in pool.items() if now - v.last_used > IDLE_S]:
+                del pool[k]
+            s = pool.get(sid)
+            if s is None:
+                s = pool[sid] = Session(sess.scene, device, api=api, lock=sess.lock)
+            s.last_used = now
+            return s
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -273,6 +289,7 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                                   {"ok": False, "error": f"{type(e).__name__}: {e}"})
 
         def _get_viewer(self, u, q):
+            sess = get_sess(q)
             if u.path == "/replay":
                 tid = q.get("id", "")
                 if tid not in api.trajs:
@@ -294,6 +311,7 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                 scenes = sorted(d.name for d in splats.iterdir() if (d / "scene.json").exists())
                 return self._send(200, json.dumps({"scenes": scenes, "scene": sess.scene.name,
                                                    "policies": sess.list_policies(), "mode": sess.mode,
+                                                   "sid": q.get("sid") or None, "sessions": len(pool),
                                                    "waypoints": sess.scene.waypoints.tolist()}).encode(),
                                   "application/json")
             if u.path == "/reset":
@@ -367,7 +385,7 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                 from . import race_jobs
                 try:
                     req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-                    code, out = race_jobs.start(req.get("course") or {}, float(req.get("minutes", 10)))
+                    code, out = race_jobs.start(req.get("course") or req.get("slug") or {}, float(req.get("minutes", 10)))
                     return self._json(code, out)
                 except Exception as e:  # noqa: BLE001
                     return self._json(400, {"ok": False, "error": f"{type(e).__name__}: {e}"})

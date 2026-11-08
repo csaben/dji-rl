@@ -12,6 +12,7 @@ from .race import course_hash
 REPO = Path(__file__).resolve().parents[2]
 JOBS = REPO / "runs" / "race"
 MAX_MIN = 60.0
+PLANNER_RACES = REPO.parent / "dji-planner" / "library" / "races"
 
 
 def _unit(job):
@@ -58,6 +59,9 @@ def ghost(job=None, course=None):
         f = JOBS / job / "ghost.json"
         return json.loads(f.read_text()) if f.exists() else None
     if course:
+        lib = PLANNER_RACES / f"{course}.json"
+        if "/" not in course and ".." not in course and lib.exists():   # a planner library slug
+            course = course_hash(json.loads(lib.read_text()))
         best = None
         for f in JOBS.glob("r_*/ghost.json"):
             g = json.loads(f.read_text())
@@ -67,7 +71,12 @@ def ghost(job=None, course=None):
     return None
 
 
-def start(course: dict, minutes: float):
+def start(course, minutes: float):
+    if isinstance(course, str):                                        # planner library slug
+        lib = PLANNER_RACES / f"{course}.json"
+        if "/" in course or ".." in course or not lib.exists():
+            return 404, {"ok": False, "error": f"no race {course!r} in the planner library"}
+        course = json.loads(lib.read_text())
     scene = course.get("scene", "")
     if not scene or "/" in scene or not (REPO / "data" / "splats" / scene / "esdf.npz").exists():
         return 400, {"ok": False, "error": f"unknown scene {scene!r}"}
