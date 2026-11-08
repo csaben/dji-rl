@@ -28,6 +28,48 @@ REPO = Path(__file__).resolve().parents[2]
 PAGE = Path(__file__).with_name("viewer.html")
 
 
+def draw_gates(img, depth, V, K, gates, nxt=0):
+    """Draw race gates (vertical rings, ~0.15 m tube) into img [H,W,3], hidden behind the splat where
+    the rendered expected depth is nearer. gates: [{x,y,z,yaw_deg,diameter_m}], nxt = index of the next gate."""
+    H, W = img.shape[:2]
+    dev = img.device
+    th = torch.linspace(0, 2 * math.pi, 361, device=dev)[:-1]
+    P, C = [], []
+    for i, g in enumerate(gates):
+        c = torch.tensor([float(g["x"]), float(g["y"]), float(g["z"])], device=dev)
+        a = math.radians(float(g["yaw_deg"]))
+        lat = torch.tensor([-math.sin(a), math.cos(a), 0.0], device=dev)
+        up = torch.tensor([0.0, 0.0, 1.0], device=dev)
+        r0 = float(g.get("diameter_m", 2.5)) / 2
+        for dr in (-0.07, 0.0, 0.07):
+            P.append(c + (r0 + dr) * (torch.cos(th)[:, None] * lat + torch.sin(th)[:, None] * up))
+        col = (1.0, 0.55, 0.1) if i == nxt else (0.95, 0.95, 0.95) if i == nxt + 1 else \
+              (0.35, 0.4, 0.45) if i < nxt else (0.55, 0.75, 1.0)
+        C.append(torch.tensor(col, device=dev).expand(3 * len(th), 3))
+    if not P:
+        return img
+    P, C = torch.cat(P), torch.cat(C)
+    pc = (V[:3, :3] @ P.T).T + V[:3, 3]
+    z = pc[:, 2]
+    ok = z > 0.2
+    u = K[0, 0] * pc[:, 0] / z.clamp_min(1e-3) + K[0, 2]
+    v = K[1, 1] * pc[:, 1] / z.clamp_min(1e-3) + K[1, 2]
+    ui, vi = u.round().long(), v.round().long()
+    ok &= (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
+    d = depth[vi.clamp(0, H - 1), ui.clamp(0, W - 1)]
+    ok &= (d <= 0.05) | (z < d + 0.3)                  # visible: in front of the splat (or sky)
+    rad = (0.07 * K[0, 0] / z.clamp_min(1e-3)).clamp(1, 4).round().long()
+    ui, vi, rad, C = ui[ok], vi[ok], rad[ok], C[ok]
+    out = img.clone()
+    for dx in range(-4, 5):
+        for dy in range(-4, 5):
+            m = (abs(dx) <= rad) & (abs(dy) <= rad)
+            x, y = (ui + dx)[m], (vi + dy)[m]
+            k = (x >= 0) & (x < W) & (y >= 0) & (y < H)
+            out[y[k], x[k]] = out[y[k], x[k]] * 0.15 + C[m][k] * 0.85
+    return out
+
+
 class Session:
     def __init__(self, scene: Scene, device: str, api=None, lock=None):
         self.dev = torch.device(device)
@@ -178,7 +220,8 @@ class Session:
         self.replay_poi = tr[i].get("poi", -1)
         return pos, vel, yaw, t, dur
 
-    def frame(self, sticks, view: str, pitch_deg: float, noclip: bool = False, cam: str = "fpv", t_override=None):
+    def frame(self, sticks, view: str, pitch_deg: float, noclip: bool = False, cam: str = "fpv", t_override=None,
+              gates=None, next_gate=0):
         with self.lock:
             now = time.time()
             dt = min(now - self.last_t, 0.2)
@@ -208,7 +251,12 @@ class Session:
                 back = torch.stack([torch.cos(yaw), torch.sin(yaw), torch.zeros_like(yaw)], -1)
                 cam_pos = pos - 6.0 * back + torch.tensor([0.0, 0.0, 3.0], device=self.dev)
                 pitch = torch.full_like(yaw, -math.atan2(3.0, 6.0))
-            img = r.render(cam_pos, yaw, pitch)[0, ..., :3]
+            if gates:
+                from .render import viewmats
+                out = r.render(cam_pos, yaw, pitch, depth=True)[0]
+                img = draw_gates(out[..., :3], out[..., 3], viewmats(cam_pos, yaw, pitch)[0], r.K, gates, next_gate)
+            else:
+                img = r.render(cam_pos, yaw, pitch)[0, ..., :3]
             if time.time() - self.flash < 0.25:
                 img = img * 0.5 + torch.tensor([0.5, 0, 0], device=self.dev)
             im = Image.fromarray((img.clamp(0, 1).cpu().numpy() * 255).astype("uint8"))
@@ -304,8 +352,11 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                 return self._send(200, b"ok", "text/plain")
             if u.path == "/frame":
                 sticks = [float(q.get(k, 0)) for k in ("f", "r", "u", "y")]
+                from . import race_jobs
+                course = race_jobs.course_by_key(q["gates"]) if q.get("gates") else None
                 jpg, st = sess.frame(sticks, q.get("view", "hd"), float(q.get("pitch", -10)), q.get("noclip") == "1",
-                                     cam=q.get("cam", "fpv"))
+                                     cam=q.get("cam", "fpv"), gates=course["gates"] if course else None,
+                                     next_gate=int(q.get("next", 0)))
                 return self._send(200, jpg, "image/jpeg", {"X-State": json.dumps(st)})
             if u.path == "/info":
                 scenes = sorted(d.name for d in splats.iterdir() if (d / "scene.json").exists())
@@ -381,6 +432,13 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
 
         def do_POST(self):
             u = urlparse(self.path)
+            if u.path == "/api/sim/course":
+                from . import race_jobs
+                try:
+                    req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                    return self._json(200, {"ok": True, "course_hash": race_jobs.register(req.get("course") or req)})
+                except Exception as e:  # noqa: BLE001
+                    return self._json(400, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             if u.path == "/api/sim/race/train":
                 from . import race_jobs
                 try:

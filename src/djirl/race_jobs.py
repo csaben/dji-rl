@@ -102,3 +102,39 @@ def start(course, minutes: float):
                    capture_output=True)
     return 200, {"ok": True, "job": job, "course_hash": h, "minutes": minutes,
                  "status_url": f"/api/sim/race/jobs/{job}", "ghost_url": f"/api/sim/race/ghost?job={job}"}
+
+
+_COURSES: dict = {}
+
+
+def register(course: dict) -> str:
+    for g in course["gates"]:
+        for k in ("x", "y", "z", "yaw_deg"):
+            float(g[k])
+    h = course_hash(course)
+    _COURSES[h] = course
+    d = JOBS / "courses"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{h}.json").write_text(json.dumps(course))
+    return h
+
+
+def course_by_key(key: str):
+    """course hash (registered, or from any job) or planner library slug -> course dict (cached)."""
+    if key in _COURSES:
+        return _COURSES[key]
+    if "/" in key or ".." in key:
+        return None
+    for f in [JOBS / "courses" / f"{key}.json", PLANNER_RACES / f"{key}.json"]:
+        if f.exists():
+            c = json.loads(f.read_text())
+            if f.parent == PLANNER_RACES:      # slugs can be edited: don't cache by slug
+                return c
+            _COURSES[key] = c
+            return c
+    for f in JOBS.glob("r_*/course.json"):
+        c = json.loads(f.read_text())
+        if course_hash(c) == key:
+            _COURSES[key] = c
+            return c
+    return None
