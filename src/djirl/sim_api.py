@@ -344,42 +344,80 @@ class SimAPI:
     # ------------------------------------------------------------ fly
     @torch.no_grad()
     def fly(self, req: dict) -> dict:
+        """See module doc. Per-point altitude: leg i flies at max(alt(p_i), alt(p_i+1)); consecutive legs at
+        the same altitude form one section flown without stopping; between sections the drone stops at the
+        via and climbs/descends in place (vertical-then-horizontal, like the Map planner)."""
         name = req["scene"]
         s = self.scene(name)
-        a = (float(req["a"]["x"]), float(req["a"]["y"]))
-        b = (float(req["b"]["x"]), float(req["b"]["y"]))
-        alt = float(req.get("alt_m", 5.0))
+        alt_m = float(req.get("alt_m", 5.0))
         speed = float(req.get("speed_mps", 3.0))
         clear = float(req.get("clear_m", 1.5))
         tol = bool(req.get("takeoff_land", True))
         wind = bool(req.get("wind", False))
-        via = [(float(v["x"]), float(v["y"])) for v in (req.get("via") or [])]
         growth = float(req.get("clear_growth_per_m", 0.0) or 0.0)
         base_h = float(req.get("clear_base_h", 0.0) or 0.0)
+        pt = lambda d: (float(d["x"]), float(d["y"]), float(d["alt"]) if d.get("alt") is not None else alt_m)
+        pts = [pt(req["a"])] + [pt(v) for v in (req.get("via") or [])] + [pt(req["b"])]
+        a, b = pts[0][:2], pts[-1][:2]
+        via = [p[:2] for p in pts[1:-1]]
+        names = ["A"] + [f"waypoint {i}" for i in range(len(via))] + ["B"]
         co = req.get("clear_origin") or {"x": a[0], "y": a[1]}
         origin = (float(co["x"]), float(co["y"]))
-        path, via_idx, why = self.plan(s, a, b, alt, clear, via=via, growth=growth, origin=origin, base_h=base_h)
-        if path is None:
-            return {"ok": False, "reason": why, "via": [{"x": x, "y": y} for x, y in via],
-                    "clear_growth_per_m": growth, "clear_base_h": base_h, "clear_origin": {"x": origin[0], "y": origin[1]}}
-        ok_pts, margin_at = self._margin_fns
-        gA = float(self.column_blocked(s, torch.tensor([[a[0]]], device=self.dev), torch.tensor([[a[1]]], device=self.dev), alt)[1][0, 0])
-        gB = float(self.column_blocked(s, torch.tensor([[b[0]]], device=self.dev), torch.tensor([[b[1]]], device=self.dev), alt)[1][0, 0])
-        # columns at A and B must be clear for the climb/descent (same test as the column occupancy mask)
+        echo = {"via": [{"x": p[0], "y": p[1], "alt": p[2]} for p in pts[1:-1]], "per_point_alt": True,
+                "clear_growth_per_m": growth, "clear_base_h": base_h, "clear_origin": {"x": origin[0], "y": origin[1]}}
+        fail = lambda why: {"ok": False, "reason": why, **echo}
+        style = req.get("flight_style", "normal")
+        if style not in ("normal", "fpv"):
+            return fail(f"flight_style must be 'normal' or 'fpv', got {style!r}")
+        poi_mode = req.get("poi_mode", "nearest")
+        if poi_mode not in ("nearest", "sequence"):
+            return fail(f"poi_mode must be 'nearest' or 'sequence', got {poi_mode!r}")
+        leg_alt = [max(pts[i][2], pts[i + 1][2]) for i in range(len(pts) - 1)]
+        # sections: maximal runs of consecutive legs at the same altitude
+        sections, i0 = [], 0
+        for i in range(1, len(leg_alt) + 1):
+            if i == len(leg_alt) or leg_alt[i] != leg_alt[i0]:
+                sections.append((i0, i, leg_alt[i0]))  # points i0 .. i (legs i0..i-1)
+                i0 = i
+        T = lambda v: torch.tensor([[v]], device=self.dev)
+        # plan each section at its altitude
+        plans, legs = [], []
+        for (p0, p1, alt) in sections:
+            path, via_idx, why = self.plan(s, pts[p0][:2], pts[p1][:2], alt, clear, via=[q[:2] for q in pts[p0 + 1:p1]],
+                                           growth=growth, origin=origin, base_h=base_h)
+            if path is None:
+                why = why.replace("A ", f"{names[p0]} ", 1) if p0 else why
+                why = why.replace(" B ", f" {names[p1]} ") if p1 != len(pts) - 1 else why
+                return fail(why)
+            plans.append((path, via_idx, self._margin_fns, alt))
+            cuts = [0] + list(via_idx) + [len(path) - 1]
+            for k in range(p1 - p0):
+                seg = path[cuts[k]:cuts[k + 1] + 1, :2]
+                legs.append({"from": p0 + k, "to": p0 + k + 1, "alt": alt,
+                             "length_m": round(float(np.linalg.norm(np.diff(seg, axis=0), axis=1).sum()), 2)})
+        # vertical checks: takeoff/landing columns at A and B; in-place altitude changes at section joints
+        def col_check(i, z_to):
+            x, y = pts[i][:2]
+            blk, gz = self.column_blocked(s, T(x), T(y), z_to)
+            if bool(blk[0, 0]):
+                above = float(gz[0, 0]) - float(self._last_terrain[0, 0])
+                return (f"{names[i]} is on a roof/canopy ({above:.1f} m above the terrain)" if above > GROUND_MAX
+                        else f"vertical column above {names[i]} is blocked (overhang between ground and {z_to} m)")
+            return None
         if tol:
-            for nm, (x, y) in (("A", a), ("B", b)):
-                blk, _ = self.column_blocked(s, torch.tensor([[x]], device=self.dev), torch.tensor([[y]], device=self.dev), alt)
-                if bool(blk[0, 0]):
-                    _, gz = self.column_blocked(s, torch.tensor([[x]], device=self.dev), torch.tensor([[y]], device=self.dev), alt)
-                    above = float(gz[0, 0]) - float(self._last_terrain[0, 0])
-                    why = (f"{nm} is on a roof/canopy ({above:.1f} m above the terrain)" if above > GROUND_MAX
-                           else f"vertical column above {nm} is blocked (overhang between ground and {alt} m)")
-                    return {"ok": False, "reason": why}
-        P = StickParams(dr=0.0, wind_std=0.3 if wind else 0.0)
-        dyn = StickDynamics(1, P, self.dev, control_dt=0.1, substeps=5)
-        start = torch.tensor([[a[0], a[1], (gA + 0.35) if tol else alt]], device=self.dev)
-        d0 = path[1] - path[0] if len(path) > 1 else np.array([1.0, 0, 0])
-        dyn.reset(torch.tensor([0], device=self.dev), start, torch.tensor([math.atan2(d0[1], d0[0])], device=self.dev))
+            for i, z in ((0, sections[0][2]), (len(pts) - 1, sections[-1][2])):
+                why = col_check(i, z)
+                if why:
+                    return fail(why)
+        for (pa, pb, za), (_, _, zb) in zip(sections, sections[1:]):
+            x, y = pts[pb][:2]
+            zs = torch.arange(min(za, zb), max(za, zb) + 1e-6, 0.2, device=self.dev)
+            col = torch.stack([torch.full_like(zs, x), torch.full_like(zs, y), zs], -1)
+            if bool((self.q(s, col) < DRONE_R + 0.1).any()):
+                verb = "climb" if zb > za else "descend"
+                return fail(f"can't {verb} at {names[pb]} from {za:g} m to {zb:g} m (overhang)")
+        gA = float(self.column_blocked(s, T(a[0]), T(a[1]), sections[0][2])[1][0, 0])
+        gB = float(self.column_blocked(s, T(b[0]), T(b[1]), sections[-1][2])[1][0, 0])
         pois = []
         for i, pi in enumerate(req.get("pois") or []):
             px_, py_ = float(pi["x"]), float(pi["y"])
@@ -387,50 +425,62 @@ class SimAPI:
             if pz is None:  # terrain height + 1 m
                 pz = float(self._terrain_at(s, torch.tensor([px_], device=self.dev), torch.tensor([py_], device=self.dev))[0]) + 1.0
             pois.append({"x": px_, "y": py_, "z": round(float(pz), 3), "label": pi.get("label", f"poi{i}")})
-        poi_mode = req.get("poi_mode", "nearest")
-        if poi_mode not in ("nearest", "sequence"):
-            return {"ok": False, "reason": f"poi_mode must be 'nearest' or 'sequence', got {poi_mode!r}"}
-        style = req.get("flight_style", "normal")
-        if style not in ("normal", "fpv"):
-            return {"ok": False, "reason": f"flight_style must be 'normal' or 'fpv', got {style!r}"}
         if style == "fpv":
-            a_lat = float(req.get("a_lat", 0.8 * P.a_acc))
-            def ok_fn(pts):
-                return bool(ok_pts(torch.tensor(pts, dtype=torch.float32, device=self.dev)).all())
-            curve, kappa = fillet_curve(path, speed, a_lat, ok_fn, max_dev={vi: 1.0 for vi in via_idx})
-
-            def depart_ok(pos):
-                """climbing departure: >= 2 m up, and the straight climb from here to the curve point
-                10 m ahead at cruise altitude keeps clearance"""
-                if pos[2] - gA < 2.0:
-                    return False
-                j = min(len(curve) - 1, int(10.0 / 0.25))
-                seg = np.linspace(pos, curve[j], 40)
-                return bool(ok_pts(torch.tensor(seg, dtype=torch.float32, device=self.dev)).all())
-
-            ctl = FpvController(curve, kappa, alt, speed, P, gB + 0.35 if tol else None, (a[0], a[1]), a_lat,
-                                float(req.get("fpv_gimbal_deg", -10.0)), depart_ok if tol else (lambda p: False))
             pois = []
-        else:
-            ctl = PursuitController(path, alt, speed, P, gB + 0.35 if tol else None, (a[0], a[1]),
-                                    pois=pois, poi_mode=poi_mode)
+        P = StickParams(dr=0.0, wind_std=0.3 if wind else 0.0)
+        a_lat = float(req.get("a_lat", 0.8 * P.a_acc))
+        gimbal0 = float(req.get("fpv_gimbal_deg", -10.0)) if style == "fpv" else -10.0
+
+        def make_ctl(k):
+            path, via_idx, (ok_pts, _), alt = plans[k]
+            last = k == len(plans) - 1
+            land = (gB + 0.35) if (tol and last) else None
+            start_xy = pts[sections[k][0]][:2]
+            if style == "fpv":
+                ok_fn = lambda q: bool(ok_pts(torch.tensor(q, dtype=torch.float32, device=self.dev)).all())
+                curve, kappa = fillet_curve(path, speed, a_lat, ok_fn, max_dev={vi: 1.0 for vi in via_idx})
+
+                def depart_ok(pos, curve=curve):
+                    if k > 0 or pos[2] - gA < 2.0:  # climbing departure only from the ground at A
+                        return False
+                    j = min(len(curve) - 1, int(10.0 / 0.25))
+                    seg = np.linspace(pos, curve[j], 40)
+                    return bool(ok_pts(torch.tensor(seg, dtype=torch.float32, device=self.dev)).all())
+                c = FpvController(curve, kappa, alt, speed, P, land, start_xy, a_lat, gimbal0,
+                                  depart_ok if tol else (lambda q: False))
+                c.curve = curve
+                return c
+            return PursuitController(path, alt, speed, P, land, start_xy, pois=pois, poi_mode=poi_mode)
+
+        dyn = StickDynamics(1, P, self.dev, control_dt=0.1, substeps=5)
+        path0 = plans[0][0]
+        start = torch.tensor([[a[0], a[1], (gA + 0.35) if tol else sections[0][2]]], device=self.dev)
+        d0 = path0[1] - path0[0] if len(path0) > 1 else np.array([1.0, 0, 0])
+        dyn.reset(torch.tensor([0], device=self.dev), start, torch.tensor([math.atan2(d0[1], d0[0])], device=self.dev))
+        # full planned path (vertical joints appear as two points with the same x,y)
+        full = np.concatenate([plans[0][0]] + [p[0] for p in plans[1:]])
         traj, collisions, contact, min_clear, touchdown = [], 0, False, 1e9, False
-        prev_v = None
-        min_margin = 1e9
-        arc = ArcTracker(path)
+        prev_v, min_margin = None, 1e9
+        arc = ArcTracker(full)
         via_s, start_i = [], 0
-        for k, vi in enumerate(via_idx):  # arc length of each via along the planned path (in order)
-            sv, start_i = arc.arc_of(np.array(via[k]), start=min(start_i, max(vi - 1, 0)))
+        for k, v in enumerate(via):  # arc length of each via along the planned path (in order)
+            sv, start_i = arc.arc_of(np.array(v), start=start_i)
             via_s.append(sv)
         via_reached = [None] * len(via)
-        t_max = sum(np.linalg.norm(np.diff(path, axis=0), axis=1)) / max(speed, 0.5) * 3 + 60
-        t = 0.0
-        reached = False
+        t_max = sum(l["length_m"] for l in legs) / max(speed, 0.5) * 3 + 60 + 20 * len(sections)
+        t, reached, sec = 0.0, False, 0
+        ctl = make_ctl(0)
         while t < t_max:
             pos = dyn.pos[0].cpu().numpy()
             vel = dyn.vel[0].cpu().numpy()
             yaw = float(dyn.yaw[0])
             cmd, done = ctl.command(pos, vel, yaw)
+            if done and sec < len(plans) - 1:  # hovering at a section joint: next section climbs/descends in place
+                prev = ctl
+                sec += 1
+                ctl = make_ctl(sec)
+                ctl.active, ctl.gimbal_deg = prev.active, prev.gimbal_deg
+                cmd, done = ctl.command(pos, vel, yaw)
             clear_now = float(self.q(s, dyn.pos)[0])
             s_drone = arc.update(pos[:2])
             for k, sv in enumerate(via_s):
@@ -444,7 +494,7 @@ class SimAPI:
                          "yaw": round(yaw, 4), "cmd": [round(float(c), 3) for c in cmd], "clear": round(clear_now, 3),
                          "gimbal_pitch_deg": round(ctl.gimbal_deg, 2), "poi": ctl.active,
                          "curvature": round(getattr(ctl, "cur_kappa", 0.0), 4), "lat_acc": round(lat_acc, 3),
-                         "seg": seg_i})
+                         "seg": seg_i, "section": sec})
             prev_v = vel
             if done:
                 reached = True
@@ -453,9 +503,9 @@ class SimAPI:
             sd = self.q(s, torch.cat(subs))
             if ctl.phase == "cruise":  # clearance stat = en-route only (takeoff/landing touch the ground)
                 min_clear = min(min_clear, float(sd.min()))
-                min_margin = min(min_margin, float(margin_at(torch.cat(subs)).min()))
+                min_margin = min(min_margin, float(plans[sec][2][1](torch.cat(subs)).min()))
             hit = bool(sd.min() < DRONE_R)
-            landing = tol and ctl.phase in ("descend", "done") and float(dyn.pos[0, 2]) - gB < 0.8
+            landing = tol and sec == len(plans) - 1 and ctl.phase in ("descend", "done") and float(dyn.pos[0, 2]) - gB < 0.8
             if hit and landing:
                 touchdown = True
             elif hit and not contact:
@@ -465,14 +515,15 @@ class SimAPI:
         final = np.array([traj[-1]["x"], traj[-1]["y"]])
         tid = uuid.uuid4().hex[:10]
         length = float(sum(math.dist((p["x"], p["y"], p["z"]), (q["x"], q["y"], q["z"])) for p, q in zip(traj, traj[1:])))
-        out = {"ok": True, "id": tid, "scene": name, "path": [[round(float(v), 3) for v in p] for p in path], "traj": traj,
-               "pois": pois, "poi_mode": poi_mode, "style": style,
-               "via": [{"x": x, "y": y} for x, y in via], "via_reached": via_reached,
-               "clear_growth_per_m": growth, "clear_base_h": base_h, "clear_origin": {"x": origin[0], "y": origin[1]},
+        out = {"ok": True, "id": tid, "scene": name, "path": [[round(float(v), 3) for v in p] for p in full], "traj": traj,
+               "pois": pois, "poi_mode": poi_mode, "style": style, **echo, "legs": legs, "via_reached": via_reached,
                "min_margin_m": round(min_margin, 3) if min_margin < 1e8 else None,
-               **({"curve": [[round(float(v), 3) for v in p] for p in curve[::4]]} if style == "fpv" else {}),
+               **({"curve": [[round(float(v), 3) for v in p] for p in np.concatenate([fillet_curve(pl[0], speed, a_lat,
+                   lambda q, f=pl[2][0]: bool(f(torch.tensor(q, dtype=torch.float32, device=self.dev)).all()),
+                   max_dev={vi: 1.0 for vi in pl[1]})[0] for pl in plans])[::4]]} if style == "fpv" else {}),
                "length_m": round(length, 2), "duration_s": round(t, 2), "min_clear_m": round(min_clear, 3),
-               "collisions": collisions, "touchdown": touchdown, "reached": reached, "final_err_m": round(float(np.linalg.norm(final - np.array(b))), 3)}
+               "collisions": collisions, "touchdown": touchdown, "reached": reached,
+               "final_err_m": round(float(np.linalg.norm(final - np.array(b))), 3)}
         self.trajs[tid] = out
         while len(self.trajs) > 20:
             self.trajs.popitem(last=False)
