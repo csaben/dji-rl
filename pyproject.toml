@@ -18,6 +18,7 @@ dependencies = [
     "pillow",
     "websockets>=12",    # pilot server (src/djirl/pilot.py)
     "pycolmap==4.2.1",   # SfM for reconstruction (tools/sfm.py, tools/train_splat.py)
+    "aiohttp>=3.9",
 ]
 
 [project.scripts]
