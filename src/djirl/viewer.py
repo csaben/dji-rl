@@ -37,6 +37,7 @@ class Session:
         self.policy = None
         self.policy_name = None
         self.env = None
+        self.api = None
 
     # ---------------------------------------------------------------- scene / reset
     def load_scene(self, scene: Scene):
@@ -145,8 +146,9 @@ class Session:
 
     def start_replay(self, traj: dict):
         if traj["scene"] != self.scene.name:
-            from .scene import load_scene
-            self.load_scene(load_scene(REPO / "data" / "splats" / traj["scene"]))
+            # the sim API's cached copy (already on this GPU): no second upload of splat + ESDF
+            self.load_scene(self.api.scene(traj["scene"]) if self.api else
+                            __import__("djirl.scene", fromlist=["load_scene"]).load_scene(REPO / "data" / "splats" / traj["scene"]))
         self.replay = traj
         self.replay_t0 = time.time()
         self.replay_fixed = None
@@ -230,8 +232,11 @@ class Session:
 
 def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
     from .sim_api import SimAPI
-    sess = Session(scene, device)
     api = SimAPI(device)
+    scene = scene.to(device)
+    api.scenes[scene.name] = scene
+    sess = Session(scene, device)
+    sess.api = api
     splats = REPO / "data" / "splats"
 
     class H(BaseHTTPRequestHandler):
@@ -254,6 +259,17 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                 return self._send(200, PAGE.read_bytes(), "text/html; charset=utf-8")
             if u.path.startswith("/api/sim/"):
                 return self._api_get(u.path[len("/api/sim/"):], q)
+            try:
+                return self._get_viewer(u, q)
+            except Exception as e:  # noqa: BLE001  (e.g. CUDA OOM loading a scene): JSON error, not a dropped connection
+                import traceback
+                traceback.print_exc()
+                if isinstance(e, torch.OutOfMemoryError):
+                    torch.cuda.empty_cache()
+                return self._json(503 if isinstance(e, torch.OutOfMemoryError) else 500,
+                                  {"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+        def _get_viewer(self, u, q):
             if u.path == "/replay":
                 tid = q.get("id", "")
                 if tid not in api.trajs:
@@ -292,7 +308,7 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                 if not (splats / name / "scene.json").exists() or "/" in name:
                     return self._send(404, b"no such scene", "text/plain")
                 with sess.lock:
-                    sess.load_scene(load_scene(splats / name))
+                    sess.load_scene(api.scene(name))
                     sess.set_mode("manual", None)
                 return self._send(200, b"ok", "text/plain")
             return self._send(404, b"not found", "text/plain")
@@ -323,6 +339,10 @@ def serve(scene: Scene, host="0.0.0.0", port=8965, device="cuda:1"):
                 return self._json(404, {"error": f"unknown endpoint {what}"})
             except KeyError as e:
                 return self._json(404, {"error": str(e)})
+            except Exception as e:  # noqa: BLE001
+                if isinstance(e, torch.OutOfMemoryError):
+                    torch.cuda.empty_cache()
+                return self._json(503 if isinstance(e, torch.OutOfMemoryError) else 500, {"error": f"{type(e).__name__}: {e}"})
 
         def do_POST(self):
             u = urlparse(self.path)
