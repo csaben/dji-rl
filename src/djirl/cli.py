@@ -169,6 +169,12 @@ def cmd_serve(a):
     serve(_scene(a.scene), host=a.host, port=a.port, device=a.device)
 
 
+def cmd_pilot_serve(a):
+    from .pilot import PilotCore, serve
+    core = PilotCore(a.ckpt, a.hazard_ckpt, a.device, thr=a.thr, lookahead=a.lookahead, speed_cap=a.speed_cap, log_dir=a.log_dir)
+    serve(core, a.host, a.port)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="djirl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -236,6 +242,13 @@ def main():
         _scene(a.scene), a.ckpt, a.episodes, a.envs, a.device, a.trigger, a.hazard_ckpt, a.thr, a.cruise,
         tuple(a.pilots.split(",")), a.chunk, a.out, a.seed,
         tuple(float(x) for x in a.lookahead.split(","))))
+    p = sub.add_parser("pilot-serve", help="live hazard trigger + policy for the phone mission runner (docs/pilot-protocol.md)")
+    p.add_argument("--ckpt", default="runs/route-wlref-2/policy.pt"); p.add_argument("--hazard-ckpt", default="runs/hazard-wlref/hazard.pt")
+    p.add_argument("--device", default="cuda:1"); p.add_argument("--host", default="100.80.98.4"); p.add_argument("--port", type=int, default=8971)
+    p.add_argument("--thr", type=float, default=0.5); p.add_argument("--lookahead", type=float, default=4.0)
+    p.add_argument("--speed-cap", type=float, default=4.0, help="m/s cap on the policy's horizontal command")
+    p.add_argument("--log-dir", default="runs/pilot")
+    p.set_defaults(f=cmd_pilot_serve)
     a = ap.parse_args()
     a.f(a)
 
