@@ -285,10 +285,10 @@ def main():
     T = np.eye(4)
     if len(names) >= 5:
         src = np.array([by[n] for n in names])
-        s, R, t, err, keep = robust_sim(src, enu)
+        s, R, t, err, gkeep = robust_sim(src, enu)
         T[:3, :3], T[:3, 3] = s * R, t
-        print(f"georef: {keep.sum()}/{len(names)} GPS frames used, scale {s:.3f}, "
-              f"residual median {np.median(err[keep]):.2f} m (GPS is ~±11 m at 4 decimals), origin {origin}")
+        print(f"georef: {gkeep.sum()}/{len(names)} GPS frames used, scale {s:.3f}, "
+              f"residual median {np.median(err[gkeep]):.2f} m (GPS is ~±11 m at 4 decimals), origin {origin}")
     else:
         print("georef: not enough GPS frames; leaving SfM frame (no metric scale!)")
     T = level_ground(T, params["means"].detach().cpu().numpy(), params["opacities"].detach().sigmoid().cpu().numpy(),
@@ -306,6 +306,16 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     save_ply(g, out / f"{a.name}.ply")
     (out / f"{a.name}.transform.json").write_text(json.dumps(T.tolist()))
+    # geo block for the scene (planner UI shows scale/heading/residual): SfM -> ENU fit summary
+    if len(names) >= 5:
+        Rs = T[:3, :3]
+        sc_fit = float(np.cbrt(abs(np.linalg.det(Rs))))
+        heading = float(np.degrees(np.arctan2(Rs[1, 0], Rs[0, 0])))
+        geo = {"lat0": origin[0], "lon0": origin[1], "yaw_deg": 0.0, "scale": round(sc_fit, 5),
+               "heading_deg": round(heading, 3), "residual_m": round(float(np.median(err[gkeep])), 3),
+               "gps_frames": int(gkeep.sum()), "gps_frames_total": len(names),
+               "note": "ENU origin = first GPS fix; scale = ENU metres per SfM unit; heading = SfM->ENU rotation about up"}
+        (out / f"{a.name}.geo.json").write_text(json.dumps(geo, indent=2))
     # waypoints: 6 points spread along the flown (GPS-registered) drone path, in ENU
     enu_c = (T[:3, :3] @ centers.T).T + T[:3, 3]
     drone = [i for i, v in enumerate(views) if v["name"].startswith("drone/")] or list(range(len(views)))

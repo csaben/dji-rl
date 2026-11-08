@@ -67,6 +67,9 @@ def cmd_import_ply(a):
     wps = torch.tensor(json.loads(Path(a.waypoints).read_text())) if a.waypoints else torch.zeros(1, 3)
     # save the (already transformed) gaussians with an identity transform
     d = save_scene(Scene(a.name, g, esdf, wps.float()), SPLATS, notes=f"imported from {a.ply}")
+    geo = Path(a.ply).with_suffix(".geo.json")
+    if geo.exists():  # gitignored sidecar with GPS origin + fit quality
+        (d / "geo.json").write_text(geo.read_text())
     print(f"{len(g.means)} gaussians, esdf {tuple(esdf.sdf.shape)} -> {d}")
 
 

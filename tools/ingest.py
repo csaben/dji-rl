@@ -23,6 +23,7 @@ import argparse
 import bisect
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -173,6 +174,110 @@ def do_video(video: Path, fps: float, width: int | None) -> None:
     print(f"{video} -> {out.relative_to(REPO)}: {n} frames, {tag}")
 
 
+# ------------------------------------------------------------------ Flight Lab live-stream captures
+
+def _read_csv(path: Path) -> tuple[list[str], list[list[str]]]:
+    import csv
+    with path.open() as f:
+        rows = list(csv.reader(f))
+    return rows[0], rows[1:]
+
+
+def _col(header, *cands):
+    """first header column whose lowercase name equals or contains one of cands (in priority order)"""
+    low = [h.strip().lower() for h in header]
+    for c in cands:
+        if c in low:
+            return low.index(c)
+    for c in cands:
+        for i, h in enumerate(low):
+            if c in h and not h.endswith("_age_ms"):
+                return i
+    return None
+
+
+def do_capture(stream: Path, fps: float, width: int | None, latency_ms: float) -> None:
+    """flightlab_<stamp>.stream.h26x + telemetry/flightlab_<stamp>{.video.csv,.csv} -> frames + per-frame poses.
+    Frame i of the elementary stream = row i of .video.csv (Flight Lab writes them in the same order); each
+    frame's time is its t_arrival_ns minus `latency_ms` (video link latency), and telemetry is interpolated
+    there. Output frames.jsonl rows carry latitude/longitude (full precision), rel_alt, alt_gps, velocity,
+    attitude and gimbal, ready for SfM priors and georeferencing."""
+    import bisect as _b
+    stamp = stream.name.split(".")[0]
+    tel_dir = stream.parent.parent / "telemetry"
+    vcsv, tcsv = tel_dir / f"{stamp}.video.csv", tel_dir / f"{stamp}.csv"
+    for f in (vcsv, tcsv):
+        if not f.exists():
+            raise FileNotFoundError(f)
+    vh, vrows = _read_csv(vcsv)
+    ti = _col(vh, "t_arrival_ns")
+    t_frame = [int(r[ti]) for r in vrows]
+    th, trows = _read_csv(tcsv)
+    cols = {k: _col(th, *c) for k, c in {
+        "t_ns": ("t_ns",), "latitude": ("lat", "latitude"), "longitude": ("lon", "longitude", "lng"),
+        "alt_gps": ("alt_gps", "altitude"), "rel_alt": ("alt_rel", "rel_alt", "relative_altitude"),
+        "vel_n": ("vel_n", "vn", "velocity_n"), "vel_e": ("vel_e", "ve", "velocity_e"), "vel_d": ("vel_d", "vd", "velocity_d"),
+        "att_yaw": ("att_yaw", "yaw"), "att_pitch": ("att_pitch", "pitch"), "att_roll": ("att_roll", "roll"),
+        "gimbal_pitch": ("gimbal_pitch",), "gimbal_yaw": ("gimbal_yaw",), "gimbal_roll": ("gimbal_roll",)}.items()}
+    print("telemetry columns:", {k: (th[v] if v is not None else None) for k, v in cols.items()})
+    if cols["t_ns"] is None or cols["latitude"] is None:
+        raise ValueError(f"{tcsv}: need t_ns and lat columns, header was {th}")
+    T, V = [], {k: [] for k in cols if k != "t_ns" and cols[k] is not None}
+    for r in trows:
+        try:
+            T.append(int(r[cols["t_ns"]]))
+            for k in V:
+                V[k].append(float(r[cols[k]]) if r[cols[k]] not in ("", "nan", "null") else float("nan"))
+        except (ValueError, IndexError):
+            continue
+
+    def interp(key, t):
+        j = _b.bisect_left(T, t)
+        if j <= 0 or j >= len(T):
+            return None
+        a, b = V[key][j - 1], V[key][j]
+        w = (t - T[j - 1]) / max(T[j] - T[j - 1], 1)
+        if key.endswith("yaw"):  # unwrap degrees
+            d = (b - a + 180) % 360 - 180
+            return a + w * d
+        return a + w * (b - a)
+
+    out = out_dir_for(stream)
+    frames_dir = out / "frames_all"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    fmt = "hevc" if stream.suffix.lower() in (".h265", ".hevc") else "h264"
+    vf = [] if not width else ["-vf", f"scale={width}:-2"]
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", fmt, "-i", str(stream),
+                    "-vsync", "passthrough", *vf, "-q:v", "2", str(frames_dir / "%06d.jpg")], check=True)
+    decoded = sorted(frames_dir.glob("*.jpg"))
+    n = min(len(decoded), len(t_frame))
+    if len(decoded) != len(t_frame):
+        print(f"warning: {len(decoded)} decoded frames vs {len(t_frame)} packet rows; pairing the first {n} in order")
+    # subsample to `fps` by arrival time, attach interpolated telemetry
+    final = out / "frames"
+    final.mkdir(exist_ok=True)
+    for old in final.glob("*.jpg"):
+        old.unlink()
+    rows, next_t, t0 = [], None, t_frame[0]
+    for i in range(n):
+        t = t_frame[i] - int(latency_ms * 1e6)
+        if next_t is not None and t < next_t:
+            continue
+        row = {"file": f"frames/{len(rows) + 1:06d}.jpg", "t": round((t - t0) / 1e9, 4), "t_ns": t, "src_frame": i}
+        for k in V:
+            v = interp(k, t)
+            if v is not None and v == v:
+                row[k] = v
+        if "latitude" not in row:
+            continue
+        next_t = t + int(1e9 / fps)
+        decoded[i].replace(final / f"{len(rows) + 1:06d}.jpg")
+        rows.append(row)
+    shutil.rmtree(frames_dir)
+    write_jsonl(out / "frames.jsonl", rows)
+    print(f"{stream} -> {out.relative_to(REPO)}: {len(rows)} posed frames from {n} stream frames (latency {latency_ms} ms)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -188,7 +293,16 @@ def main() -> int:
         p.add_argument("--fps", type=float, default=2.0)
         p.add_argument("--width", type=int, default=None, help="resize width (keeps aspect)")
 
+    c = sub.add_parser("capture", help="Flight Lab live-stream capture (.stream.h265/.h264 + telemetry csvs)")
+    c.add_argument("stream", type=Path)
+    c.add_argument("--fps", type=float, default=4.0)
+    c.add_argument("--width", type=int, default=None)
+    c.add_argument("--latency-ms", type=float, default=0.0, help="video link latency to subtract from arrival times")
+
     a = ap.parse_args()
+    if a.cmd == "capture":
+        do_capture(a.stream, a.fps, a.width, a.latency_ms)
+        return 0
     if a.cmd == "srt":
         recs = parse_srt(a.srt)
         if a.out:
