@@ -199,6 +199,10 @@ class PilotCore:
     def frame(self, h: dict, jpeg: bytes) -> dict:
         t0 = time.time()
         mf = self.mf
+        r = h.get("pos_rel") or {}
+        if any(h.get(k) is None for k in ("vel_ned", "yaw_deg")) or any(r.get(k) is None for k in ("e", "n", "up")):
+            return {"type": "cmd", "seq": h.get("seq"), "t_ms": h.get("t_ms"), "idle": True, "want": "mission",
+                    "hazard": False, "reason": "no pose (no active mission)"}
         pos, yaw, vel = mf.pose(h)
         t = float(h["t_ms"]) / 1000.0
         if self.last_t is not None and t > self.last_t:
@@ -218,7 +222,14 @@ class PilotCore:
         body = lambda v: np.array([c * v[0] + s * v[1], s * v[0] - c * v[1], v[2]])     # ENU -> body FRU
         gh = h.get("ground_h_m")
         height = float(gh) if gh is not None and float(gh) >= 0 else -1.0
-        if h.get("sticks_now") is not None:
+        cv = h.get("cmd_vel")
+        if cv is not None and self.flying != "policy":       # MSDK velocity-mode command -> normalised sticks
+            up = float(cv.get("up_mps", 0))
+            self.last_action = np.array([float(cv.get("fwd_mps", 0)) / V_H_MAX, float(cv.get("right_mps", 0)) / V_H_MAX,
+                                         up / (V_UP_MAX if up > 0 else V_DOWN_MAX),
+                                         math.radians(float(cv.get("yaw_rate_dps", 0))) / YAW_RATE_MAX],
+                                        dtype=np.float32).clip(-1, 1)
+        elif h.get("sticks_now") is not None and self.flying != "policy":
             self.last_action = np.asarray(h["sticks_now"], dtype=np.float32).clip(-1, 1)
         elif self.flying != "policy":                       # mission runner: estimate its sticks from velocity
             bv = body(vel)
@@ -241,12 +252,17 @@ class PilotCore:
         need_c = float(self.brake.stopping_distance(torch.tensor(self.cruise_now))) + 1.0
         clear_c = float(fwd @ to_c) > math.cos(math.radians(25)) and clear_f >= need_c
         reported = h.get("flying_by", self.flying)
-        if reported in ("rc", "hover") and self.flying == "policy":
+        if reported in ("rc", "hover", "manual") and self.flying == "policy":
             self.flying, self.t_mode = "mission", 0.0            # phone stopped following us: stop driving
         reason = None
         if self.flying == "mission" and hazard and reported == "mission":
             self.flying, self.t_mode, reason = "policy", 0.0, ("p_brake" if p_brake > self.thr else "clearance")
             self.takeovers += 1
+        elif self.flying == "policy" and self.mode == "shadow":
+            # the phone keeps flying the mission and never takes our sticks: "policy" here only means
+            # "would be avoiding", so release once the hazard has been quiet for quiet_s
+            if self.quiet >= self.quiet_s:
+                self.flying, self.t_mode, reason = "mission", 0.0, "clear"
         elif self.flying == "policy":
             if (self.t_mode >= self.min_policy_s and self.quiet >= self.quiet_s and clear_c
                     and self._map_los(pos, goal, 0.25 + 0.5)):

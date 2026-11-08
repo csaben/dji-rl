@@ -47,14 +47,15 @@ or `{"type": "error", "error": "..."}`.
 |---|---|
 | `seq` | frame counter |
 | `t_ms` | phone monotonic ms when the frame came out of the SDK |
-| `pos_rel` | metres east/north/up from the takeoff spot, the same frame as `route_rel` |
+| `pos_rel` | **real** metres east/north/up from the takeoff spot, the same frame as `route_rel` (scene offsets x `scale_corr`, rotated by `yaw_trim_deg`) |
 | `vel_ned` | aircraft velocity, m/s, north/east/down (DJI's frame) |
 | `yaw_deg` | aircraft compass yaw (0 = north, clockwise) |
 | `flying_by` | who is actually flying right now: `mission`, `policy`, `hover`, or `rc` (pilot took the sticks) |
-| `sticks_now` | optional: the normalised virtual-stick command currently sent, `[fwd, right, up, yaw_right]` in -1..1 |
+| `cmd_vel` | optional: the velocity-mode virtual-stick command currently sent, `{fwd_mps, right_mps, up_mps, yaw_rate_dps}` (+ = clockwise) |
+| `sticks_now` | optional alternative: normalised `[fwd, right, up, yaw_right]` in -1..1 |
 | `ground_h_m` | optional: downward-sensor height, or null |
 
-Telemetry should be the latest sample at the frame's time.
+Telemetry should be the latest sample at the frame's time. With no active mission, send `pos_rel`/`vel_ned`/`yaw_deg` as null: the reply is `{"idle": true, "want": "mission"}`.
 
 **Camera:**
 - Send 4:3 if the stream allows it; 16:9 is centre-cropped to 4:3, which narrows the field of view. The policy was trained on 82 deg horizontal FOV, 4:3.
@@ -76,6 +77,8 @@ The server handles only the newest frame. If frames arrive faster than it proces
 | `mission` | keep flying the mission |
 | `policy` | apply `sticks` (below) as virtual-stick velocity commands, body frame |
 | `hover` | stop, hold position, and alert the pilot (policy timed out after 20 s, or a server error) |
+
+In `shadow` mode, `want: "policy"` means "would be avoiding now". It releases once the hazard has been quiet for 1 s, because the mission keeps flying.
 
 While `want` is `policy`, each cmd carries `sticks`:
 
