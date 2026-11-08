@@ -256,7 +256,10 @@ class SimAPI:
 
         hreq = lambda pts: base_h + growth * torch.hypot(pts[..., 0] - ox, pts[..., 1] - oy)
         ok_pts = lambda pts: (self.q(s, pts) >= clear) & (d2_at(pts) >= hreq(pts))
-        self._margin_fns = (ok_pts, lambda pts: d2_at(pts) - hreq(pts))
+        # empty slice (e.g. above zmax): no obstacle to measure a margin to -> margin_at returns +inf
+        empty = not blocked0.any()
+        self._margin_fns = (ok_pts, (lambda pts: torch.full(pts.shape[:-1], float("inf"), device=pts.device)) if empty
+                            else (lambda pts: d2_at(pts) - hreq(pts)))
         nx, ny = free.shape
         cell = lambda p: (int(round((p[0] - xs[0]) / res)), int(round((p[1] - ys[0]) / res)))
         stops = [("A", a)] + [(f"waypoint {i}", v) for i, v in enumerate(via)] + [("B", b)]

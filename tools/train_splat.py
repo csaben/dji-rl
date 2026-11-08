@@ -124,6 +124,27 @@ def robust_sim(src, dst, iters=5, k=2.5):
     return s, R, t, err, keep
 
 
+def fit_sigmas(src, dst, keep, n_boot=300, block=10, seed=0):
+    """1-sigma of the sim3 fit's scale (relative) and heading (deg) by moving-block bootstrap over the
+    inlier GPS frames (consecutive frames share GPS error, so plain resampling would be overconfident).
+    Captures fit noise only, not a constant GPS bias."""
+    i = np.flatnonzero(keep)
+    if len(i) < 2 * block:
+        return None, None
+    rng = np.random.default_rng(seed)
+    s0, R0, _ = umeyama(src[i], dst[i])
+    h0 = math.atan2(R0[1, 0], R0[0, 0])
+    ss, hs = [], []
+    nb = len(i) // block
+    for _ in range(n_boot):
+        st = rng.integers(0, len(i) - block + 1, nb)
+        j = i[(st[:, None] + np.arange(block)[None]).ravel()]
+        s, R, _ = umeyama(src[j], dst[j])
+        ss.append(s / s0 - 1)
+        hs.append(math.remainder(math.atan2(R[1, 0], R[0, 0]) - h0, 2 * math.pi))
+    return float(np.std(ss)), float(np.degrees(np.std(hs)))
+
+
 def level_ground(T, means, opac, cam_enu, iters=400, tol=0.15):
     """RANSAC a plane through the ground under the cameras; rotate it to z=0 with +z up."""
     p = (T[:3, :3] @ means.T).T + T[:3, 3]
@@ -311,10 +332,14 @@ def main():
         Rs = T[:3, :3]
         sc_fit = float(np.cbrt(abs(np.linalg.det(Rs))))
         heading = float(np.degrees(np.arctan2(Rs[1, 0], Rs[0, 0])))
+        scale_sigma, heading_sigma = fit_sigmas(src, enu, gkeep)
         geo = {"lat0": origin[0], "lon0": origin[1], "yaw_deg": 0.0, "scale": round(sc_fit, 5),
                "heading_deg": round(heading, 3), "residual_m": round(float(np.median(err[gkeep])), 3),
+               "scale_sigma": None if scale_sigma is None else round(scale_sigma, 5),
+               "heading_sigma_deg": None if heading_sigma is None else round(heading_sigma, 3),
                "gps_frames": int(gkeep.sum()), "gps_frames_total": len(names),
-               "note": "ENU origin = first GPS fix; scale = ENU metres per SfM unit; heading = SfM->ENU rotation about up"}
+               "note": "ENU origin = first GPS fix; scale = ENU metres per SfM unit; heading = SfM->ENU rotation about up; "
+                       "scale_sigma (relative) / heading_sigma_deg = 1-sigma of the GPS fit, block bootstrap, fit noise only"}
         (out / f"{a.name}.geo.json").write_text(json.dumps(geo, indent=2))
     # waypoints: 6 points spread along the flown (GPS-registered) drone path, in ENU
     enu_c = (T[:3, :3] @ centers.T).T + T[:3, 3]
